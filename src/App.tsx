@@ -20,9 +20,10 @@ import { api, loginUrl, type Limits, type User } from '@/lib/api'
 import { SquarePage } from '@/pages/square'
 import { SharePage } from '@/pages/share'
 import { MinePage } from '@/pages/mine'
+import { AdminPage } from '@/pages/admin'
 
-type Tab = 'square' | 'share' | 'mine'
-const TABS: Tab[] = ['square', 'share', 'mine']
+type Tab = 'square' | 'share' | 'mine' | 'admin'
+const TABS: Tab[] = ['square', 'share', 'mine', 'admin']
 
 const LOGIN_ERRORS: Record<string, string> = {
   state: '登录超时或被打断，请再试一次',
@@ -90,6 +91,7 @@ export default function App() {
               <TabsTrigger value="square">广场</TabsTrigger>
               <TabsTrigger value="share">分享邀请码</TabsTrigger>
               <TabsTrigger value="mine">我的</TabsTrigger>
+              {user?.is_admin ? <TabsTrigger value="admin">管理</TabsTrigger> : null}
             </TabsList>
             <div className="ml-auto">
               {!ready ? null : user ? (
@@ -110,6 +112,7 @@ export default function App() {
                     </DropdownMenuLabel>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem onSelect={() => go('mine')}>我的邀请码</DropdownMenuItem>
+                    {user.is_admin ? <DropdownMenuItem onSelect={() => go('admin')}>管理员</DropdownMenuItem> : null}
                     <DropdownMenuItem onSelect={logout}>
                       <LogOut />
                       退出登录
@@ -131,6 +134,7 @@ export default function App() {
               <TabsTrigger value="square">广场</TabsTrigger>
               <TabsTrigger value="share">分享</TabsTrigger>
               <TabsTrigger value="mine">我的</TabsTrigger>
+              {user?.is_admin ? <TabsTrigger value="admin">管理</TabsTrigger> : null}
             </TabsList>
           </div>
         </header>
@@ -145,11 +149,16 @@ export default function App() {
           <TabsContent value="mine">
             <MinePage user={user} version={version} onChanged={refresh} />
           </TabsContent>
+          {user?.is_admin ? (
+            <TabsContent value="admin">
+              <AdminPage version={version} onChanged={refresh} />
+            </TabsContent>
+          ) : null}
         </main>
       </Tabs>
 
       <footer className="mx-auto max-w-5xl px-4 pb-10 text-xs text-muted-foreground">
-        码池里的邀请码对所有人隐藏，被领走后立刻从广场消失，只有领取人和分享者能看到。
+        码池里的邀请码对所有人隐藏，只有领取人和分享者能看到。码用不了可以在「我的 → 我领到的」里反馈。
       </footer>
       <Toaster position="top-center" />
     </div>

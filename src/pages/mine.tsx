@@ -1,25 +1,55 @@
 import { useEffect, useState } from 'react'
-import { Heart } from 'lucide-react'
+import { Coins, Heart } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 import { CopyButton } from '@/components/copy-button'
-import { api, ApiError, loginUrl, timeAgo, type Claim, type SharedCode, type SharedSummary, type User } from '@/lib/api'
+import { ReportDialog } from '@/components/report-dialog'
+import {
+  api,
+  ApiError,
+  ldc,
+  loginUrl,
+  PAYOUT_STATUS,
+  timeAgo,
+  timeUntil,
+  type Claim,
+  type Claimer,
+  type MyPayout,
+  type SharedCode,
+  type SharedSummary,
+  type User,
+} from '@/lib/api'
 
 type Props = { user: User | null; version: number; onChanged: () => void }
 
 export function MinePage({ user, version, onChanged }: Props) {
   const [shared, setShared] = useState<SharedCode[] | null>(null)
+  const [claimers, setClaimers] = useState<Claimer[]>([])
   const [summary, setSummary] = useState<SharedSummary | null>(null)
+  const [payouts, setPayouts] = useState<MyPayout[]>([])
   const [claims, setClaims] = useState<Claim[] | null>(null)
+  const [editing, setEditing] = useState<SharedCode | null>(null)
+  const [remaining, setRemaining] = useState('')
+  const [reporting, setReporting] = useState<Claim | null>(null)
 
   useEffect(() => {
     if (!user) return
@@ -27,7 +57,9 @@ export function MinePage({ user, version, onChanged }: Props) {
       .myShared()
       .then((r) => {
         setShared(r.codes)
+        setClaimers(r.claimers)
         setSummary(r.summary)
+        setPayouts(r.payouts)
       })
       .catch(() => setShared([]))
     api
@@ -41,7 +73,7 @@ export function MinePage({ user, version, onChanged }: Props) {
       <Card className="mx-auto max-w-xl">
         <CardHeader>
           <CardTitle>登录后查看</CardTitle>
-          <CardDescription>这里会列出你分享的码被谁领走了，以及你领到的码。</CardDescription>
+          <CardDescription>这里会列出你分享的码被谁用了、还剩几次，以及你领到的码。</CardDescription>
         </CardHeader>
         <CardFooter>
           <Button asChild>
@@ -72,6 +104,26 @@ export function MinePage({ user, version, onChanged }: Props) {
     }
   }
 
+  const openEdit = (c: SharedCode) => {
+    setEditing(c)
+    setRemaining(String(Math.max(0, c.max_uses - c.used)))
+  }
+
+  const saveRemaining = async () => {
+    if (!editing) return
+    try {
+      await api.setRemaining(editing.id, Number(remaining))
+      toast('剩余次数已更新')
+      setEditing(null)
+      onChanged()
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : '没改成')
+    }
+  }
+
+  const byCode = (id: string) => claimers.filter((x) => x.code_id === id)
+  const hasRewards = payouts.length > 0 || !!summary?.rewarded_cents
+
   return (
     <Tabs defaultValue="shared" className="gap-6">
       <TabsList>
@@ -80,15 +132,19 @@ export function MinePage({ user, version, onChanged }: Props) {
       </TabsList>
 
       <TabsContent value="shared" className="flex flex-col gap-6">
-        <div className="grid grid-cols-3 gap-3">
-          <Stat label="还在池子里" value={summary?.available} />
-          <Stat label="已被领走" value={summary?.claimed} />
-          <Stat label="收到感谢" value={summary?.thanks} icon />
+        <div className={`grid gap-3 ${hasRewards ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-3'}`}>
+          <Stat label="还能被领（次）" value={summary?.available} />
+          <Stat label="已被领取" value={summary?.claimed} />
+          <Stat label="收到感谢" value={summary?.thanks} icon={<Heart className="size-3.5" />} />
+          {hasRewards ? (
+            <Stat label="LDC 已到账" value={ldc(summary?.rewarded_cents)} icon={<Coins className="size-3.5" />} />
+          ) : null}
         </div>
+
         <Card>
           <CardHeader>
             <CardTitle>分享记录</CardTitle>
-            <CardDescription>被领走的码会显示领取人；对方点了感谢，这里会亮起红心。</CardDescription>
+            <CardDescription>能看到每个码还剩几次、被谁用了。对方点了感谢，名字旁会亮起红心。</CardDescription>
           </CardHeader>
           <CardContent>
             {shared === null ? (
@@ -101,60 +157,102 @@ export function MinePage({ user, version, onChanged }: Props) {
                   <TableRow>
                     <TableHead>产品</TableHead>
                     <TableHead>邀请码</TableHead>
-                    <TableHead>状态</TableHead>
-                    <TableHead>领取人</TableHead>
+                    <TableHead>剩余</TableHead>
+                    <TableHead>用的人</TableHead>
                     <TableHead className="text-right">操作</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {shared.map((c) => (
-                    <TableRow key={c.id}>
-                      <TableCell className="font-medium">{c.product}</TableCell>
-                      <TableCell className="max-w-40 truncate font-mono text-xs">{c.code}</TableCell>
-                      <TableCell>
-                        {c.status === 'claimed' ? (
-                          <Badge variant="secondary">已领走 · {timeAgo(c.claimed_at!)}</Badge>
-                        ) : (
-                          <Badge variant="outline">在池中</Badge>
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {c.claimer_username ? (
-                          <div className="flex items-center gap-2">
-                            <Avatar className="size-6">
-                              {c.claimer_avatar ? <AvatarImage src={c.claimer_avatar} /> : null}
-                              <AvatarFallback className="text-xs">
-                                {c.claimer_username.slice(0, 1).toUpperCase()}
-                              </AvatarFallback>
-                            </Avatar>
-                            <span className="text-sm">{c.claimer_username}</span>
-                            {c.thanked_at ? <Heart className="size-4 fill-foreground" aria-label="已感谢" /> : null}
+                  {shared.map((c) => {
+                    const left = Math.max(0, c.max_uses - c.used)
+                    return (
+                      <TableRow key={c.id}>
+                        <TableCell className="font-medium">
+                          <div className="flex flex-col gap-1">
+                            {c.product}
+                            {c.reports_open ? <Badge variant="destructive">有人反馈无效</Badge> : null}
                           </div>
-                        ) : (
-                          <span className="text-sm text-muted-foreground">—</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        {c.status === 'available' ? (
-                          <Button variant="ghost" size="sm" onClick={() => withdraw(c.id)}>
-                            撤回
-                          </Button>
-                        ) : null}
-                      </TableCell>
-                    </TableRow>
-                  ))}
+                        </TableCell>
+                        <TableCell className="max-w-40 truncate font-mono text-xs">{c.code}</TableCell>
+                        <TableCell>
+                          {c.mode === 'multi' ? (
+                            <Badge variant={left > 0 ? 'outline' : 'secondary'}>
+                              {left > 0 ? `剩 ${left} 次` : '已用完'} · 已用 {c.used}
+                            </Badge>
+                          ) : c.status === 'claimed' ? (
+                            <Badge variant="secondary">已领走</Badge>
+                          ) : (
+                            <Badge variant="outline">在池中</Badge>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          <People list={byCode(c.id)} />
+                        </TableCell>
+                        <TableCell className="text-right whitespace-nowrap">
+                          {c.mode === 'multi' ? (
+                            <Button variant="ghost" size="sm" onClick={() => openEdit(c)}>
+                              改次数
+                            </Button>
+                          ) : null}
+                          {c.status === 'available' ? (
+                            <Button variant="ghost" size="sm" onClick={() => withdraw(c.id)}>
+                              撤回
+                            </Button>
+                          ) : null}
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
                 </TableBody>
               </Table>
             )}
           </CardContent>
         </Card>
+
+        {hasRewards ? (
+          <Card>
+            <CardHeader>
+              <CardTitle>LDC 奖励</CardTitle>
+              <CardDescription>
+                领取后先过观察期，没人反馈无效就自动打到你的 LINUX DO Credit 账户。
+                {summary?.pending_cents ? ` 还有 ${ldc(summary.pending_cents)} LDC 等待发放。` : ''}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>产品</TableHead>
+                    <TableHead>类型</TableHead>
+                    <TableHead>金额</TableHead>
+                    <TableHead>状态</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {payouts.map((p) => (
+                    <TableRow key={p.id}>
+                      <TableCell className="font-medium">{p.product}</TableCell>
+                      <TableCell>{p.kind === 'share' ? '贡献奖励' : '领取奖励'}</TableCell>
+                      <TableCell className="tabular-nums">{ldc(p.amount_cents)} LDC</TableCell>
+                      <TableCell>
+                        <Badge variant={p.status === 'sent' ? 'default' : 'outline'}>
+                          {p.status === 'pending' ? `${timeUntil(p.due_at)}发放` : PAYOUT_STATUS[p.status]}
+                        </Badge>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        ) : null}
       </TabsContent>
 
       <TabsContent value="claimed">
         <Card>
           <CardHeader>
             <CardTitle>我领到的</CardTitle>
-            <CardDescription>这些码只有你和分享者看得到。用上了别忘了说声谢谢。</CardDescription>
+            <CardDescription>这些码只有你和分享者看得到。用上了别忘了说声谢谢；用不了可以反馈。</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col">
             {claims === null ? (
@@ -167,21 +265,30 @@ export function MinePage({ user, version, onChanged }: Props) {
                   {i > 0 ? <Separator /> : null}
                   <div className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center">
                     <div className="flex min-w-0 flex-1 flex-col gap-1">
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <span className="font-medium">{c.product}</span>
                         <span className="text-xs text-muted-foreground">
                           来自 {c.sharer_username} · {timeAgo(c.claimed_at)}
                         </span>
+                        <ReportBadge claim={c} />
                       </div>
                       <code className="truncate rounded-md bg-muted px-2 py-1 font-mono text-sm">{c.code}</code>
                       {c.note ? <span className="text-xs text-muted-foreground">留言：{c.note}</span> : null}
+                      {c.void_at ? (
+                        <span className="text-xs text-muted-foreground">这个码已确认无效，可以去广场再领一个。</span>
+                      ) : null}
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex flex-wrap gap-2">
                       <CopyButton value={c.code} label="复制" />
                       <Button variant="outline" size="sm" disabled={!!c.thanked_at} onClick={() => thank(c.id)}>
                         <Heart className={c.thanked_at ? 'fill-foreground' : undefined} />
                         {c.thanked_at ? '已感谢' : '感谢'}
                       </Button>
+                      {!c.report_status && !c.void_at ? (
+                        <Button variant="ghost" size="sm" onClick={() => setReporting(c)}>
+                          用不了
+                        </Button>
+                      ) : null}
                     </div>
                   </div>
                 </div>
@@ -190,16 +297,84 @@ export function MinePage({ user, version, onChanged }: Props) {
           </CardContent>
         </Card>
       </TabsContent>
+
+      <Dialog open={!!editing} onOpenChange={(o) => !o && setEditing(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>改 {editing?.product} 的剩余次数</DialogTitle>
+            <DialogDescription>
+              比如你在别处用掉了几次，可以在这里扣掉。已经有 {editing?.used ?? 0} 人通过这里用了，
+              最多还能填 {editing ? Math.max(0, editing.product_max_uses - editing.used) : 0} 次。填 0 就不再发出。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="remaining">还能用几次</Label>
+            <Input
+              id="remaining"
+              type="number"
+              inputMode="numeric"
+              min={0}
+              max={editing ? Math.max(0, editing.product_max_uses - editing.used) : 0}
+              value={remaining}
+              onChange={(e) => setRemaining(e.target.value)}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditing(null)}>
+              取消
+            </Button>
+            <Button onClick={saveRemaining} disabled={remaining.trim() === ''}>
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <ReportDialog
+        claimId={reporting?.id ?? null}
+        product={reporting?.product}
+        onClose={() => setReporting(null)}
+        onDone={onChanged}
+      />
     </Tabs>
   )
 }
 
-function Stat({ label, value, icon }: { label: string; value: number | null | undefined; icon?: boolean }) {
+function ReportBadge({ claim }: { claim: Claim }) {
+  if (claim.void_at || claim.report_status === 'confirmed') return <Badge variant="destructive">已确认无效</Badge>
+  if (claim.report_status === 'open') return <Badge variant="outline">已反馈，等待处理</Badge>
+  if (claim.report_status === 'dismissed') return <Badge variant="secondary">反馈未通过</Badge>
+  return null
+}
+
+function People({ list }: { list: Claimer[] }) {
+  if (list.length === 0) return <span className="text-sm text-muted-foreground">—</span>
+  const shown = list.slice(0, 4)
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {shown.map((x) => (
+        <div key={x.id} className="flex items-center gap-1" title={`${x.username} · ${timeAgo(x.claimed_at)}`}>
+          <Avatar className="size-6">
+            {x.avatar_url ? <AvatarImage src={x.avatar_url} /> : null}
+            <AvatarFallback className="text-xs">{x.username.slice(0, 1).toUpperCase()}</AvatarFallback>
+          </Avatar>
+          <span className="text-sm">{x.username}</span>
+          {x.thanked_at ? <Heart className="size-3.5 fill-foreground" aria-label="已感谢" /> : null}
+        </div>
+      ))}
+      {list.length > shown.length ? (
+        <span className="text-xs text-muted-foreground">等 {list.length} 人</span>
+      ) : null}
+    </div>
+  )
+}
+
+function Stat({ label, value, icon }: { label: string; value: number | string | null | undefined; icon?: React.ReactNode }) {
   return (
     <Card className="gap-1 py-4">
       <CardHeader className="px-4">
         <CardDescription className="flex items-center gap-1">
-          {icon ? <Heart className="size-3.5" /> : null}
+          {icon}
           {label}
         </CardDescription>
         <CardTitle className="text-2xl tabular-nums">{value ?? 0}</CardTitle>

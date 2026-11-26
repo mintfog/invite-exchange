@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Gift, Heart, Search } from 'lucide-react'
+import { Coins, Gift, Heart, Search } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -18,7 +18,19 @@ import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 
 import { CopyButton } from '@/components/copy-button'
-import { api, ApiError, loginUrl, timeAgo, type Limits, type NewClaim, type Product, type Totals, type User } from '@/lib/api'
+import { ReportDialog } from '@/components/report-dialog'
+import {
+  api,
+  ApiError,
+  ldc,
+  loginUrl,
+  timeAgo,
+  type Limits,
+  type NewClaim,
+  type Product,
+  type Totals,
+  type User,
+} from '@/lib/api'
 
 type Props = {
   user: User | null
@@ -35,6 +47,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
   const [claiming, setClaiming] = useState<string | null>(null)
   const [claim, setClaim] = useState<NewClaim | null>(null)
   const [thanked, setThanked] = useState(false)
+  const [reporting, setReporting] = useState<NewClaim | null>(null)
 
   useEffect(() => {
     api
@@ -84,14 +97,15 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
       <section className="flex flex-col gap-2">
         <h1 className="text-2xl font-semibold tracking-tight">有多的邀请码，就留给需要的人</h1>
         <p className="text-sm text-muted-foreground">
-          用 LinuxDO 账号登录，每个产品领一个。码被领走后立刻销毁，不再给别人看；分享者会看到是谁领走、有没有道谢。
+          用 LinuxDO 账号登录，每个产品领一个，系统随机轮流发给你，让每个分享者都能被用到。码池里的码对所有人隐藏，只有领取人和分享者能看到。
         </p>
       </section>
 
-      <section className="grid grid-cols-3 gap-3">
+      <section className={`grid gap-3 ${totals?.rewarded_cents ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-3'}`}>
         <Stat label="池中可领" value={totals?.available} />
         <Stat label="已送出" value={totals?.claimed} />
         <Stat label="分享者" value={totals?.sharers} />
+        {totals?.rewarded_cents ? <Stat label="已奖励 LDC" value={ldc(totals.rewarded_cents)} /> : null}
       </section>
 
       {lowTrust ? (
@@ -129,12 +143,11 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
         ) : shown.length === 0 ? (
           <Card>
             <CardHeader>
-              <CardTitle>{query ? '没有找到这个产品' : '广场还是空的'}</CardTitle>
-              <CardDescription>有多余的邀请码？分享出来，第一个产品就由你创建。</CardDescription>
+              <CardTitle>{query ? '没有找到这个产品' : '广场还没有产品'}</CardTitle>
+              <CardDescription>
+                {query ? '产品由管理员添加，想要新产品可以联系管理员。' : '管理员添加产品后，就可以分享和领取邀请码了。'}
+              </CardDescription>
             </CardHeader>
-            <CardFooter>
-              <Button onClick={onGoShare}>分享邀请码</Button>
-            </CardFooter>
           </Card>
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -142,19 +155,35 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
               <Card key={p.key}>
                 <CardHeader>
                   <CardTitle className="truncate">{p.name}</CardTitle>
-                  <CardDescription>最近分享于 {timeAgo(p.last_shared_at)}</CardDescription>
+                  <CardDescription className="line-clamp-2">
+                    {p.description ||
+                      (p.last_shared_at ? `最近分享于 ${timeAgo(p.last_shared_at)}` : '还没有人分享，来当第一个')}
+                  </CardDescription>
                   <CardAction>
                     <Badge variant={p.available > 0 ? 'default' : 'secondary'}>
-                      {p.available > 0 ? `可领 ${p.available}` : '已领完'}
+                      {p.available > 0 ? (p.mode === 'multi' ? `剩 ${p.available} 次` : `可领 ${p.available}`) : '已领完'}
                     </Badge>
                   </CardAction>
                 </CardHeader>
-                <CardContent className="flex items-center gap-4 text-sm text-muted-foreground">
-                  <span className="flex items-center gap-1">
-                    <Heart className="size-4" />
-                    已送出 {p.claimed}
-                  </span>
-                  {p.mine_available > 0 ? <span>其中 {p.mine_available} 个是你分享的</span> : null}
+                <CardContent className="flex flex-col gap-3 text-sm text-muted-foreground">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="outline">
+                      {p.mode === 'multi' ? `每人一个码 · 每码 ${p.max_uses} 人可用` : '一次性码'}
+                    </Badge>
+                    {p.mode === 'multi' && p.available_codes > 0 ? (
+                      <span>{p.available_codes} 位分享者轮流发</span>
+                    ) : null}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                    <span className="flex items-center gap-1">
+                      <Heart className="size-4" />
+                      已送出 {p.claimed}
+                    </span>
+                    {p.mine_available > 0 ? (
+                      <span>其中 {p.mine_available} {p.mode === 'multi' ? '次' : '个'}是你的</span>
+                    ) : null}
+                  </div>
+                  <RewardLine product={p} />
                 </CardContent>
                 <CardFooter>
                   <ClaimButton
@@ -176,7 +205,10 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
           <DialogHeader>
             <DialogTitle>领到了 {claim?.product} 的邀请码</DialogTitle>
             <DialogDescription>
-              这个码现在只属于你，已从广场移除。随时可以在「我的 → 我领到的」里找回。
+              {claim?.mode === 'multi'
+                ? `这是 ${claim?.sharer_username} 的邀请码，可以多人使用。`
+                : '这个码现在只属于你，已从广场移除。'}
+              随时可以在「我的 → 我领到的」里找回。
             </DialogDescription>
           </DialogHeader>
           <div className="flex items-center gap-2">
@@ -185,6 +217,15 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
           </div>
           {claim?.note ? <p className="text-sm text-muted-foreground">分享者留言：{claim.note}</p> : null}
           <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setReporting(claim)
+                setClaim(null)
+              }}
+            >
+              码用不了？
+            </Button>
             <Button variant="outline" onClick={doThank} disabled={thanked}>
               <Heart />
               {thanked ? '已感谢' : '感谢分享者'}
@@ -193,11 +234,31 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ReportDialog
+        claimId={reporting?.id ?? null}
+        product={reporting?.product}
+        onClose={() => setReporting(null)}
+        onDone={onChanged}
+      />
     </div>
   )
 }
 
-function Stat({ label, value }: { label: string; value: number | null | undefined }) {
+function RewardLine({ product: p }: { product: Product }) {
+  if (!p.share_reward_cents && !p.claim_reward_cents) return null
+  const parts = []
+  if (p.share_reward_cents) parts.push(`码首次被领 +${ldc(p.share_reward_cents)}`)
+  if (p.claim_reward_cents) parts.push(`每被领一次 +${ldc(p.claim_reward_cents)}`)
+  return (
+    <span className="flex items-center gap-1 text-foreground">
+      <Coins className="size-4" />
+      分享奖励 LDC：{parts.join('，')}
+    </span>
+  )
+}
+
+function Stat({ label, value }: { label: string; value: number | string | null | undefined }) {
   return (
     <Card className="gap-1 py-4">
       <CardHeader className="px-4">

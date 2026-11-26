@@ -1,6 +1,12 @@
 # 邀请码交换
 
-分享多余的产品邀请码（Muse、ChatterFly、小豆……），用 LinuxDO 账号登录后每个产品领一个。码被领走立刻从广场消失，只有领取人和分享者能看到；分享者能看到是谁领走、有没有点感谢。
+分享多余的产品邀请码（Muse、ChatterFly、小豆……），用 LinuxDO 账号登录后每个产品领一个。码池里的码对所有人隐藏，只有领取人和分享者能看到；分享者能看到是谁用了、有没有点感谢。
+
+- **产品由管理员添加**（`ADMIN_USERNAMES` 里的 LinuxDO 用户名），用户分享时只能选已有产品。
+- **两种模式**：一次性码（如 ChatterFly，每个码只给一个人，每人可放几个）；多人可用码（如 Muse，每人一个码、最多 N 人用，显示剩余次数）。
+- **随机轮流发**：领取时优先发给被领得最少的分享者，同样少的随机挑，每个分享者都能被用到。
+- **LDC 奖励**：通过 LINUX DO Credit 从站长的商户账户给分享者发 LDC。贡献奖励（每个码首次被领）和领取奖励（每被领一次）可在管理页设置，单个产品可覆盖；领取后先过观察期，没人反馈无效才发；全站 24 小时有上限。
+- **无效反馈**：领取人可以反馈码用不了，管理员确认后撤下码、取消奖励，反馈人可以再领一个。
 
 - 前端：React + Vite + shadcn/ui 官方组件（黑白灰 neutral 主题）
 - 后端：Cloudflare Worker（Hono），和前端在同一个 Worker 里，`/api/*` 走接口，其他走静态页面
@@ -18,7 +24,7 @@
 | 自己分享的码 | 自己领不到 |
 | 被禁言或未激活的 LinuxDO 账号 | 不能登录 |
 
-领取是一条 D1 `UPDATE … RETURNING` 语句完成的，挑码、确认没人领、确认没超限、标记领走在同一步里，所以两个人同时点也不会拿到同一个码（`test/api.test.mjs` 里有 20 人抢 5 个码的测试）。
+领取是一条 D1 `INSERT … SELECT … RETURNING` 语句完成的，挑码、确认没领过、确认没超限、记一次领取在同一步里，码用满时由触发器标记，所以同时点也不会超发（`test/api.test.mjs` 里有 20 人抢 5 个码、20 人抢一个 5 次码的测试）。
 
 ## shadcn/ui 组件
 
@@ -55,7 +61,13 @@ npm run db:migrate:remote
 ```bash
 npx wrangler secret put LINUXDO_CLIENT_ID
 npx wrangler secret put LINUXDO_CLIENT_SECRET
+
+# 可选：要发 LDC 奖励时，填 LINUX DO Credit 商户应用的 Client ID / Secret
+npx wrangler secret put LDC_CLIENT_ID
+npx wrangler secret put LDC_CLIENT_SECRET
 ```
+
+没设 LDC 凭证时奖励功能不会发任何东西。设好后还要在网站「管理 → LDC 奖励」里点开启。定时任务每 10 分钟发一次到期的奖励，每笔用固定的订单号（`share-<码>` / `claim-<领取>`），重试不会重复到账。
 
 ### 4. 部署
 
@@ -104,9 +116,12 @@ npm test   # 自动起本地 wrangler dev、跑 test/api.test.mjs，跑完关掉
 | POST | `/api/auth/logout` | 退出 |
 | GET | `/api/me` | 当前用户和限额 |
 | GET | `/api/products` | 广场：每个产品可领数量、已送出数量 |
-| POST | `/api/codes` | 分享 `{product, codes(一行一个), note}` |
+| POST | `/api/codes` | 分享 `{product_key, codes(一行一个), note, uses?}` |
 | DELETE | `/api/codes/:id` | 撤回自己还在池里的码（码内容会清空） |
+| PATCH | `/api/codes/:id` | 多人码改剩余次数 `{remaining}` |
 | POST | `/api/claim` | 领一个 `{product_key}` |
 | POST | `/api/claims/:id/thanks` | 感谢分享者 |
-| GET | `/api/my/shared` | 我分享的（含领取人、是否感谢） |
+| POST | `/api/claims/:id/report` | 反馈码无效 `{reason}` |
+| GET | `/api/my/shared` | 我分享的（含用的人、剩余次数、LDC 奖励） |
 | GET | `/api/my/claimed` | 我领到的 |
+| * | `/api/admin/*` | 管理员：产品、所有码、用户、无效反馈、LDC 设置和发放记录 |
