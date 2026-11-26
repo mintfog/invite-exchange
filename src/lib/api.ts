@@ -156,6 +156,7 @@ export type AdminUser = {
   given: number
   received: number
   is_admin: boolean
+  is_test: boolean
 }
 
 export type Report = {
@@ -241,7 +242,9 @@ const post = <T>(path: string, body?: unknown, method = 'POST') =>
   request<T>(path, { method, body: body === undefined ? undefined : JSON.stringify(body) })
 
 export const api = {
-  me: () => request<{ user: User | null; limits: Limits }>('/me'),
+  me: () => request<{ user: User | null; limits: Limits; test_login: boolean }>('/me'),
+  testLogin: (password: string, account: 'admin' | 'user') =>
+    post<{ ok: true }>('/auth/test-login', { password, account }),
   logout: () => post<{ ok: true }>('/auth/logout'),
   products: () => request<{ products: Product[]; totals: Totals }>('/products'),
   share: (body: { product_key: string; codes: string; note: string; uses?: number }) =>

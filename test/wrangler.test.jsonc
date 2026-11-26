@@ -17,6 +17,7 @@
     "LINUXDO_CLIENT_SECRET": "test-secret",
     "LDC_CLIENT_ID": "ldc-test",
     "LDC_CLIENT_SECRET": "ldc-secret",
-    "LDC_BASE": "http://127.0.0.1:8800"
+    "LDC_BASE": "http://127.0.0.1:8800",
+    "TEST_LOGIN_SECRET": "test-pass"
   }
 }

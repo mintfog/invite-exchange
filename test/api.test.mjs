@@ -581,6 +581,43 @@ try {
     ok('关闭后既不记新奖励也不发')
   }
 
+  console.log('测试账号')
+  {
+    const anon = new Client()
+    assert.equal((await anon.json('/api/me')).data.test_login, true)
+    const bad = await anon.json('/api/auth/test-login', 'POST', { password: 'nope' })
+    assert.equal(bad.status, 403)
+    assert.equal((await anon.json('/api/me')).data.user, null)
+    ok('密码不对不能登录测试账号')
+
+    const ta = new Client()
+    assert.equal((await ta.json('/api/auth/test-login', 'POST', { password: 'test-pass' })).status, 200)
+    const me = (await ta.json('/api/me')).data.user
+    assert.equal(me.username, '测试管理员')
+    assert.equal(me.is_admin, true)
+    assert.equal((await ta.json('/api/admin/settings')).status, 200)
+    const tu = new Client()
+    await tu.json('/api/auth/test-login', 'POST', { password: 'test-pass', account: 'user' })
+    const me2 = (await tu.json('/api/me')).data.user
+    assert.equal(me2.username, '测试用户')
+    assert.equal(me2.is_admin, false)
+    assert.equal((await tu.json('/api/admin/settings')).status, 403)
+    ok('测试管理员能进管理页，测试用户不能')
+
+    const users = (await boss.json('/api/admin/users')).data.users
+    assert.ok(users.find((u) => u.username === '测试管理员').is_test)
+    ok('管理页的用户列表标出测试账号')
+
+    await boss.json('/api/admin/settings', 'PUT', { ldc_enabled: true, hold_hours: 0 })
+    await tu.json('/api/codes', 'POST', { product_key: 'echo', codes: 'ECHO-T' })
+    const t9 = await new Client().devLogin('taker9')
+    assert.equal((await t9.json('/api/claim', 'POST', { product_key: 'echo' })).data.claim.code, 'ECHO-T')
+    const tid = (await tu.json('/api/my/shared')).data.codes.find((c) => c.code === 'ECHO-T').id
+    assert.equal((await boss.json('/api/admin/payouts')).data.payouts.filter((p) => p.code_id === tid).length, 0)
+    await boss.json('/api/admin/settings', 'PUT', { ldc_enabled: false })
+    ok('测试账号分享的码被领取，不会记 LDC 奖励')
+  }
+
   console.log(`\n全部通过：${passed} 项`)
 } catch (e) {
   console.error('\n测试失败：', e)

@@ -18,6 +18,8 @@ export interface Env {
   LDC_CLIENT_ID?: string
   LDC_CLIENT_SECRET?: string
   LDC_BASE?: string
+  /** 测试账号的登录密码（wrangler secret put），不设就没有测试账号入口 */
+  TEST_LOGIN_SECRET?: string
 }
 
 type User = {
@@ -74,7 +76,15 @@ export function productKey(name: string) {
   return name.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase()
 }
 
-function isAdmin(env: Env, username: string) {
+// 测试账号：linuxdo_id 用负数，真实 LinuxDO 账号不会撞上。用户名用中文，LinuxDO 不允许中文用户名。
+const TEST_ACCOUNTS = {
+  admin: { id: -1, username: '测试管理员' },
+  user: { id: -2, username: '测试用户' },
+} as const
+
+function isAdmin(env: Env, username: string, linuxdoId?: number) {
+  if (linuxdoId === TEST_ACCOUNTS.admin.id) return true
+  if (linuxdoId !== undefined && linuxdoId < 0) return false
   const list = (env.ADMIN_USERNAMES ?? '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
@@ -141,7 +151,7 @@ app.use('*', async (c, next) => {
     )
       .bind(await sha256(token), now())
       .first<Omit<User, 'is_admin'>>()
-    if (row) c.set('user', { ...row, is_admin: isAdmin(c.env, row.username) })
+    if (row) c.set('user', { ...row, is_admin: isAdmin(c.env, row.username, row.linuxdo_id) })
   }
   await next()
 })
@@ -294,6 +304,29 @@ app.get('/auth/dev-login', async (c) => {
   return c.redirect(c.req.query('to') || '/')
 })
 
+// 测试账号登录：密码是 Worker 机密 TEST_LOGIN_SECRET，没设就是 404
+app.post('/auth/test-login', async (c) => {
+  const secret = c.env.TEST_LOGIN_SECRET
+  if (!secret) return c.notFound()
+  const body = await c.req.json<{ password?: string; account?: string }>().catch(() => null)
+  const given = typeof body?.password === 'string' ? body.password : ''
+  // 比较哈希，不按字符逐个比较原文
+  if ((await sha256(given)) !== (await sha256(secret))) {
+    await new Promise((r) => setTimeout(r, 500))
+    return fail(c, 403, 'bad_password', '测试账号密码不对')
+  }
+  const acct = body?.account === 'user' ? TEST_ACCOUNTS.user : TEST_ACCOUNTS.admin
+  const id = await upsertUser(c.env.DB, {
+    id: acct.id,
+    username: acct.username,
+    name: acct.username,
+    avatar_url: null,
+    trust_level: 2,
+  })
+  await createSession(c, id)
+  return c.json({ ok: true })
+})
+
 app.post('/auth/logout', async (c) => {
   const token = getCookie(c, SESSION_COOKIE)
   if (token) {
@@ -307,6 +340,7 @@ app.get('/me', (c) => {
   const u = c.get('user')
   return c.json({
     user: u,
+    test_login: Boolean(c.env.TEST_LOGIN_SECRET),
     limits: {
       minTrustLevel: num(c.env.MIN_TRUST_LEVEL, 1),
       maxClaimsPerDay: num(c.env.MAX_CLAIMS_PER_DAY, 5),
@@ -606,8 +640,8 @@ async function recordRewards(db: D1Database, claimId: string, t: number) {
                 CASE WHEN EXISTS (SELECT 1 FROM reports r WHERE r.code_id = x.code_id AND r.status = 'open')
                      THEN 'held' ELSE 'pending' END,
                 ?3, ?4, ?4
-           FROM claims x JOIN products p ON p.key = x.product_key
-          WHERE x.id = ?5 AND ${amount} > 0`,
+           FROM claims x JOIN products p ON p.key = x.product_key JOIN users u ON u.id = x.sharer_id
+          WHERE x.id = ?5 AND ${amount} > 0 AND u.linuxdo_id > 0`,
       )
       .bind(id, kind, due, t, claimId)
   const code = await db.prepare('SELECT code_id FROM claims WHERE id = ?').bind(claimId).first<{ code_id: string }>()
@@ -1205,15 +1239,21 @@ admin.post('/payouts/:id/cancel', async (c) => {
 
 admin.get('/users', async (c) => {
   const { results } = await c.env.DB.prepare(
-    `SELECT u.id, u.username, u.name, u.avatar_url, u.trust_level, u.created_at, u.last_login_at,
+    `SELECT u.id, u.linuxdo_id, u.username, u.name, u.avatar_url, u.trust_level, u.created_at, u.last_login_at,
             (SELECT COUNT(*) FROM codes c WHERE c.sharer_id = u.id AND c.status <> 'withdrawn') AS codes,
             (SELECT COUNT(*) FROM claims x WHERE x.sharer_id = u.id) AS given,
             (SELECT COUNT(*) FROM claims x WHERE x.user_id = u.id) AS received
        FROM users u
       ORDER BY u.last_login_at DESC
       LIMIT 1000`,
-  ).all<{ username: string }>()
-  return c.json({ users: results.map((u) => ({ ...u, is_admin: isAdmin(c.env, u.username) })) })
+  ).all<{ username: string; linuxdo_id: number }>()
+  return c.json({
+    users: results.map((u) => ({
+      ...u,
+      is_admin: isAdmin(c.env, u.username, u.linuxdo_id),
+      is_test: u.linuxdo_id < 0,
+    })),
+  })
 })
 
 app.route('/admin', admin)

@@ -658,6 +658,7 @@ function UsersPanel({ version }: { version: number }) {
                     <div className="flex items-center gap-2">
                       <UserCell name={u.username} avatar={u.avatar_url} />
                       {u.is_admin ? <Badge>管理员</Badge> : null}
+                      {u.is_test ? <Badge variant="outline">测试账号</Badge> : null}
                     </div>
                   </TableCell>
                   <TableCell>{u.trust_level}</TableCell>

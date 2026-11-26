@@ -1,10 +1,20 @@
 import { useCallback, useEffect, useState } from 'react'
-import { LogIn, LogOut, Ticket } from 'lucide-react'
+import { FlaskConical, LogIn, LogOut, Ticket } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -16,7 +26,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Toaster } from '@/components/ui/sonner'
 
-import { api, loginUrl, type Limits, type User } from '@/lib/api'
+import { api, ApiError, loginUrl, type Limits, type User } from '@/lib/api'
 import { SquarePage } from '@/pages/square'
 import { SharePage } from '@/pages/share'
 import { MinePage } from '@/pages/mine'
@@ -43,15 +53,24 @@ export default function App() {
   const [ready, setReady] = useState(false)
   const [tab, setTab] = useState<Tab>(tabFromHash)
   const [version, setVersion] = useState(0)
+  const [testLogin, setTestLogin] = useState(false)
+  const [testOpen, setTestOpen] = useState(false)
+  const [testPassword, setTestPassword] = useState('')
+  const [testBusy, setTestBusy] = useState(false)
   const refresh = useCallback(() => setVersion((v) => v + 1), [])
 
-  useEffect(() => {
-    api
-      .me()
-      .then((r) => {
+  const loadMe = useCallback(
+    () =>
+      api.me().then((r) => {
         setUser(r.user)
         setLimits(r.limits)
-      })
+        setTestLogin(r.test_login)
+      }),
+    [],
+  )
+
+  useEffect(() => {
+    loadMe()
       .catch(() => toast.error('连不上服务器'))
       .finally(() => setReady(true))
 
@@ -64,11 +83,27 @@ export default function App() {
     const onHash = () => setTab(tabFromHash())
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
-  }, [])
+  }, [loadMe])
 
   const go = (t: string) => {
     setTab(t as Tab)
     window.history.replaceState(null, '', `#${t}`)
+  }
+
+  const loginAsTest = async (account: 'admin' | 'user') => {
+    setTestBusy(true)
+    try {
+      await api.testLogin(testPassword, account)
+      await loadMe()
+      setTestOpen(false)
+      setTestPassword('')
+      refresh()
+      toast(account === 'admin' ? '已用测试管理员登录' : '已用测试用户登录')
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : '登录失败')
+    } finally {
+      setTestBusy(false)
+    }
   }
 
   const logout = async () => {
@@ -120,12 +155,20 @@ export default function App() {
                   </DropdownMenuContent>
                 </DropdownMenu>
               ) : (
-                <Button asChild size="sm">
-                  <a href={loginUrl}>
-                    <LogIn />
-                    用 LINUX DO 登录
-                  </a>
-                </Button>
+                <div className="flex items-center gap-2">
+                  {testLogin ? (
+                    <Button size="sm" variant="ghost" onClick={() => setTestOpen(true)}>
+                      <FlaskConical />
+                      <span className="hidden sm:inline">测试账号</span>
+                    </Button>
+                  ) : null}
+                  <Button asChild size="sm">
+                    <a href={loginUrl}>
+                      <LogIn />
+                      用 LINUX DO 登录
+                    </a>
+                  </Button>
+                </div>
               )}
             </div>
           </div>
@@ -160,6 +203,40 @@ export default function App() {
       <footer className="mx-auto max-w-5xl px-4 pb-10 text-xs text-muted-foreground">
         码池里的邀请码对所有人隐藏，只有领取人和分享者能看到。码用不了可以在「我的 → 我领到的」里反馈。
       </footer>
+      <Dialog open={testOpen} onOpenChange={setTestOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>用测试账号登录</DialogTitle>
+            <DialogDescription>
+              测试账号不需要 LinuxDO。测试管理员能进管理页；测试用户是普通账号，可以拿来试分享和领取。测试账号不会收到 LDC。
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            className="flex flex-col gap-2"
+            onSubmit={(e) => {
+              e.preventDefault()
+              loginAsTest('admin')
+            }}
+          >
+            <Label htmlFor="test-password">测试账号密码</Label>
+            <Input
+              id="test-password"
+              type="password"
+              autoComplete="current-password"
+              value={testPassword}
+              onChange={(e) => setTestPassword(e.target.value)}
+            />
+          </form>
+          <DialogFooter>
+            <Button variant="outline" disabled={testBusy || !testPassword} onClick={() => loginAsTest('user')}>
+              测试用户
+            </Button>
+            <Button disabled={testBusy || !testPassword} onClick={() => loginAsTest('admin')}>
+              测试管理员
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Toaster position="top-center" />
     </div>
   )
