@@ -7,7 +7,7 @@
   "observability": { "enabled": true },
   "routes": [{ "pattern": "exchange.fshark.cloud", "custom_domain": true }],
   "workers_dev": false,
-  "triggers": { "crons": ["0 19 * * *"] },
+  "triggers": { "crons": ["0 19 * * *", "*/10 * * * *"] },
   "assets": {
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*"]
@@ -27,8 +27,12 @@
     "MAX_CLAIMS_PER_DAY": "5",
     // 每人 24 小时内最多分享几个码
     "MAX_SHARES_PER_DAY": "30",
-    "LINUXDO_BASE": "https://connect.linux.do"
+    "LINUXDO_BASE": "https://connect.linux.do",
+    // 管理员的 LinuxDO 用户名，逗号分隔
+    "ADMIN_USERNAMES": "StarFox",
+    "LDC_BASE": "https://credit.linux.do"
   }
   // 机密不要写在这里，用 wrangler secret put：
   //   LINUXDO_CLIENT_ID, LINUXDO_CLIENT_SECRET
+  //   LDC_CLIENT_ID, LDC_CLIENT_SECRET（LINUX DO Credit 商户凭证，不设就不发 LDC）
 }
