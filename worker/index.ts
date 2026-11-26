@@ -76,14 +76,12 @@ export function productKey(name: string) {
   return name.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase()
 }
 
-// 测试账号：linuxdo_id 用负数，真实 LinuxDO 账号不会撞上。用户名用中文，LinuxDO 不允许中文用户名。
-const TEST_ACCOUNTS = {
-  admin: { id: -1, username: '测试管理员' },
-  user: { id: -2, username: '测试用户' },
-} as const
+// 测试账号：只有一个普通用户，永远不是管理员。linuxdo_id 用负数，真实 LinuxDO 账号不会撞上。
+// 用户名用中文，LinuxDO 不允许中文用户名。
+const TEST_ACCOUNT = { id: -2, username: '测试用户' } as const
 
 function isAdmin(env: Env, username: string, linuxdoId?: number) {
-  if (linuxdoId === TEST_ACCOUNTS.admin.id) return true
+  // 负数 id 都是测试账号，一律不是管理员
   if (linuxdoId !== undefined && linuxdoId < 0) return false
   const list = (env.ADMIN_USERNAMES ?? '')
     .split(',')
@@ -308,14 +306,14 @@ app.get('/auth/dev-login', async (c) => {
 app.post('/auth/test-login', async (c) => {
   const secret = c.env.TEST_LOGIN_SECRET
   if (!secret) return c.notFound()
-  const body = await c.req.json<{ password?: string; account?: string }>().catch(() => null)
+  const body = await c.req.json<{ password?: string }>().catch(() => null)
   const given = typeof body?.password === 'string' ? body.password : ''
   // 比较哈希，不按字符逐个比较原文
   if ((await sha256(given)) !== (await sha256(secret))) {
     await new Promise((r) => setTimeout(r, 500))
     return fail(c, 403, 'bad_password', '测试账号密码不对')
   }
-  const acct = body?.account === 'user' ? TEST_ACCOUNTS.user : TEST_ACCOUNTS.admin
+  const acct = TEST_ACCOUNT
   const id = await upsertUser(c.env.DB, {
     id: acct.id,
     username: acct.username,

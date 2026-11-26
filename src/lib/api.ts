@@ -243,8 +243,7 @@ const post = <T>(path: string, body?: unknown, method = 'POST') =>
 
 export const api = {
   me: () => request<{ user: User | null; limits: Limits; test_login: boolean }>('/me'),
-  testLogin: (password: string, account: 'admin' | 'user') =>
-    post<{ ok: true }>('/auth/test-login', { password, account }),
+  testLogin: (password: string) => post<{ ok: true }>('/auth/test-login', { password }),
   logout: () => post<{ ok: true }>('/auth/logout'),
   products: () => request<{ products: Product[]; totals: Totals }>('/products'),
   share: (body: { product_key: string; codes: string; note: string; uses?: number }) =>

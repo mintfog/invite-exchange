@@ -90,15 +90,15 @@ export default function App() {
     window.history.replaceState(null, '', `#${t}`)
   }
 
-  const loginAsTest = async (account: 'admin' | 'user') => {
+  const loginAsTest = async () => {
     setTestBusy(true)
     try {
-      await api.testLogin(testPassword, account)
+      await api.testLogin(testPassword)
       await loadMe()
       setTestOpen(false)
       setTestPassword('')
       refresh()
-      toast(account === 'admin' ? '已用测试管理员登录' : '已用测试用户登录')
+      toast('已用测试账号登录')
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : '登录失败')
     } finally {
@@ -208,14 +208,14 @@ export default function App() {
           <DialogHeader>
             <DialogTitle>用测试账号登录</DialogTitle>
             <DialogDescription>
-              测试账号不需要 LinuxDO。测试管理员能进管理页；测试用户是普通账号，可以拿来试分享和领取。测试账号不会收到 LDC。
+              测试账号不需要 LinuxDO，是一个普通账号，可以拿来试分享和领取，不能进管理页，也不会收到 LDC。
             </DialogDescription>
           </DialogHeader>
           <form
             className="flex flex-col gap-2"
             onSubmit={(e) => {
               e.preventDefault()
-              loginAsTest('admin')
+              if (testPassword) loginAsTest()
             }}
           >
             <Label htmlFor="test-password">测试账号密码</Label>
@@ -228,11 +228,8 @@ export default function App() {
             />
           </form>
           <DialogFooter>
-            <Button variant="outline" disabled={testBusy || !testPassword} onClick={() => loginAsTest('user')}>
-              测试用户
-            </Button>
-            <Button disabled={testBusy || !testPassword} onClick={() => loginAsTest('admin')}>
-              测试管理员
+            <Button disabled={testBusy || !testPassword} onClick={() => loginAsTest()}>
+              登录测试账号
             </Button>
           </DialogFooter>
         </DialogContent>

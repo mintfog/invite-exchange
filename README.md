@@ -73,7 +73,7 @@ npx wrangler secret put LDC_CLIENT_SECRET
 npx wrangler secret put TEST_LOGIN_SECRET
 ```
 
-设好后登录按钮旁会出现「测试账号」，输入密码可以用「测试管理员」（能进管理页）或「测试用户」（普通账号）登录。测试账号不会收到 LDC。删掉这个机密（`npx wrangler secret delete TEST_LOGIN_SECRET`）入口就关了。
+设好后登录按钮旁会出现「测试账号」，输入密码可以用「测试用户」登录。它是普通账号，永远不是管理员，不能进管理页。测试账号不会收到 LDC。删掉这个机密（`npx wrangler secret delete TEST_LOGIN_SECRET`）入口就关了。
 
 没设 LDC 凭证时奖励功能不会发任何东西。设好后还要在网站「管理 → LDC 奖励」里点开启。定时任务每 10 分钟发一次到期的奖励，每笔用固定的订单号（`share-<码>` / `claim-<领取>`），重试不会重复到账。
 

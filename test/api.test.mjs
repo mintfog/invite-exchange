@@ -590,22 +590,24 @@ try {
     assert.equal((await anon.json('/api/me')).data.user, null)
     ok('密码不对不能登录测试账号')
 
-    const ta = new Client()
-    assert.equal((await ta.json('/api/auth/test-login', 'POST', { password: 'test-pass' })).status, 200)
-    const me = (await ta.json('/api/me')).data.user
-    assert.equal(me.username, '测试管理员')
-    assert.equal(me.is_admin, true)
-    assert.equal((await ta.json('/api/admin/settings')).status, 200)
     const tu = new Client()
-    await tu.json('/api/auth/test-login', 'POST', { password: 'test-pass', account: 'user' })
+    assert.equal((await tu.json('/api/auth/test-login', 'POST', { password: 'test-pass' })).status, 200)
     const me2 = (await tu.json('/api/me')).data.user
     assert.equal(me2.username, '测试用户')
     assert.equal(me2.is_admin, false)
     assert.equal((await tu.json('/api/admin/settings')).status, 403)
-    ok('测试管理员能进管理页，测试用户不能')
+    assert.equal((await tu.json('/api/admin/users')).status, 403)
+    // 以前的 account: 'admin' 参数不再有用，还是普通测试用户
+    const ta = new Client()
+    await ta.json('/api/auth/test-login', 'POST', { password: 'test-pass', account: 'admin' })
+    const me = (await ta.json('/api/me')).data.user
+    assert.equal(me.username, '测试用户')
+    assert.equal(me.is_admin, false)
+    ok('测试账号只有一个普通用户，进不了管理页')
 
     const users = (await boss.json('/api/admin/users')).data.users
-    assert.ok(users.find((u) => u.username === '测试管理员').is_test)
+    assert.ok(users.find((u) => u.username === '测试用户').is_test)
+    assert.ok(!users.some((u) => u.username === '测试管理员'))
     ok('管理页的用户列表标出测试账号')
 
     await boss.json('/api/admin/settings', 'PUT', { ldc_enabled: true, hold_hours: 0 })
