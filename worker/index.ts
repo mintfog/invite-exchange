@@ -622,7 +622,179 @@ app.get('/products', async (c) => {
   return c.json({ products, totals })
 })
 
+// ---------- 接力链图 ----------
+
+type ChainNode = { avatar: string | null; me: boolean }
+
+// 接力产品正在运作的链：从最早分享的人开始，经过每个「领了码 → 放回自己的码」的人，
+// 一直到现在：码在池子里等人领（pool），或在某人手里、TA 还没放回自己的码（waiting）。
+// 只给头像（走本站匿名地址），不给名字。
+app.get('/products/:key/chains', async (c) => {
+  const user = c.get('user')
+  const key = c.req.param('key')
+  const db = c.env.DB
+  const product = await db.prepare('SELECT name FROM products WHERE key = ? AND active = 1').bind(key).first()
+  if (!product) return fail(c, 404, 'no_product', '这个产品不存在或已下架')
+  const [{ results: codes }, { results: claims }, { results: deps }] = await Promise.all([
+    db
+      .prepare(
+        `SELECT c.id, c.sharer_id, c.status, ${REMAINING} AS remaining, c.created_at
+           FROM codes c WHERE c.product_key = ? ORDER BY c.created_at`,
+      )
+      .bind(key)
+      .all<{ id: string; sharer_id: number; status: string; remaining: number; created_at: number }>(),
+    db
+      .prepare('SELECT id, code_id, user_id FROM claims WHERE product_key = ? AND void_at IS NULL ORDER BY claimed_at')
+      .bind(key)
+      .all<{ id: string; code_id: string; user_id: number }>(),
+    db
+      .prepare(
+        "SELECT claim_id, relay_code_id, status FROM relay_deposits WHERE product_key = ? AND claim_id IS NOT NULL",
+      )
+      .bind(key)
+      .all<{ claim_id: string; relay_code_id: string | null; status: string }>(),
+  ])
+  const codeById = new Map(codes.map((x) => [x.id, x]))
+  const claimsByCode = new Map<string, typeof claims>()
+  for (const x of claims) claimsByCode.set(x.code_id, [...(claimsByCode.get(x.code_id) ?? []), x])
+  const depByClaim = new Map(deps.map((d) => [d.claim_id, d]))
+  const relayed = new Set(deps.map((d) => d.relay_code_id).filter(Boolean))
+
+  const paths: { users: number[]; state: 'pool' | 'waiting'; since: number }[] = []
+  const seen = new Set<string>()
+  const walk = (codeId: string, users: number[], since: number) => {
+    const code = codeById.get(codeId)
+    if (!code || seen.has(codeId) || paths.length >= 200) return
+    seen.add(codeId)
+    if (code.status === 'available' && code.remaining > 0) paths.push({ users, state: 'pool', since: code.created_at })
+    for (const x of claimsByCode.get(codeId) ?? []) {
+      const d = depByClaim.get(x.id)
+      const next = [...users, x.user_id]
+      if (d?.relay_code_id) walk(d.relay_code_id, next, since)
+      else if (d?.status === 'used') paths.push({ users: next, state: 'waiting', since })
+    }
+  }
+  for (const code of codes) {
+    if (!relayed.has(code.id)) walk(code.id, [code.sharer_id], code.created_at)
+  }
+
+  // 头像只走本站匿名地址：第一次用到时给用户生成一个随机编号
+  const ids = [...new Set(paths.flatMap((p) => p.users))]
+  const avatars = new Map<number, string | null>()
+  if (ids.length) {
+    await db
+      .prepare(
+        "UPDATE users SET avatar_key = lower(hex(randomblob(12))) WHERE avatar_key IS NULL AND id IN (SELECT value FROM json_each(?))",
+      )
+      .bind(JSON.stringify(ids))
+      .run()
+    const { results } = await db
+      .prepare('SELECT id, avatar_key, avatar_url IS NOT NULL AS has FROM users WHERE id IN (SELECT value FROM json_each(?))')
+      .bind(JSON.stringify(ids))
+      .all<{ id: number; avatar_key: string; has: number }>()
+    for (const r of results) avatars.set(r.id, r.has ? `/api/avatars/${r.avatar_key}` : null)
+  }
+  const MAX_NODES = 12
+  const chains = paths.map((p) => {
+    const shown = p.users.slice(-MAX_NODES)
+    return {
+      state: p.state,
+      length: p.users.length,
+      earlier: p.users.length - shown.length,
+      nodes: shown.map((id): ChainNode => ({ avatar: avatars.get(id) ?? null, me: id === user?.id })),
+    }
+  })
+  chains.sort((a, b) => b.length - a.length)
+  return c.json({ chains, relays: deps.filter((d) => d.relay_code_id).length })
+})
+
+// 匿名头像：/api/avatars/{随机编号}，地址里不带 LinuxDO 用户名
+app.get('/avatars/:key', async (c) => {
+  const row = await c.env.DB.prepare('SELECT avatar_url FROM users WHERE avatar_key = ?')
+    .bind(c.req.param('key'))
+    .first<{ avatar_url: string | null }>()
+  if (!row?.avatar_url || !/^https:\/\//.test(row.avatar_url)) return c.body(null, 404)
+  try {
+    const r = await fetch(row.avatar_url, { cf: { cacheEverything: true, cacheTtl: 86400 } })
+    const type = r.headers.get('content-type') ?? ''
+    if (!r.ok || !type.startsWith('image/')) return c.body(null, 404)
+    return new Response(r.body, {
+      headers: { 'content-type': type, 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff' },
+    })
+  } catch {
+    return c.body(null, 404)
+  }
+})
+
 // ---------- 分享 ----------
+
+// ---------- 重复码校验 ----------
+
+// 规范化后再比：去掉所有空白、全角转半角、转小写，「AB C1」和「abc1」算同一个码
+function normalizeCode(code: string) {
+  return code.normalize('NFKC').replace(/\s+/g, '').toLowerCase()
+}
+
+async function codeHash(code: string) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(normalizeCode(code)))
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+// 旧数据还没有指纹：补上（码已被撤回或作废的旧记录，原文已经清掉了，靠领取记录里的码来比）
+async function backfillCodeHashes(env: Env, limit = 200) {
+  const { results } = await env.DB.prepare(
+    'SELECT id, code FROM codes WHERE code_hash IS NULL AND code IS NOT NULL LIMIT ?',
+  )
+    .bind(limit)
+    .all<{ id: string; code: string }>()
+  if (!results.length) return 0
+  const stmts = []
+  for (const r of results) {
+    stmts.push(env.DB.prepare('UPDATE codes SET code_hash = ? WHERE id = ?').bind(await codeHash(r.code), r.id))
+  }
+  await env.DB.batch(stmts)
+  return results.length
+}
+
+// 找出不能分享的码：
+//   - 这个产品下被领过（包括领了又退还的）、或被确认无效的码
+// 已经在池子里的同一个码（大小写、空格不同也算）算重复跳过。
+// 分享过、没人领过、已撤回的码可以重新放回。
+async function findBlockedCodes(db: D1Database, productKey: string, codes: string[], hashes: string[]) {
+  const { results } = await db
+    .prepare(
+      `SELECT c.code_hash, c.sharer_id, c.status, c.invalid_at IS NOT NULL AS invalid,
+              EXISTS (SELECT 1 FROM claims x WHERE x.code_id = c.id) AS claimed
+         FROM codes c
+        WHERE c.product_key = ?1 AND c.code_hash IN (SELECT value FROM json_each(?2))`,
+    )
+    .bind(productKey, JSON.stringify(hashes))
+    .all<{ code_hash: string; sharer_id: number; status: string; invalid: number; claimed: number }>()
+  const skip = new Set<string>()
+  for (const r of results) {
+    const code = codes[hashes.indexOf(r.code_hash)]
+    if (r.claimed || r.invalid) {
+      return { block: { reason: 'used_code', message: `「${code}」已经被领过或被确认用不了，不能再分享` }, skip }
+    }
+    if (r.status !== 'withdrawn') skip.add(r.code_hash) // 已经在池子里了（自己或别人放的），算重复跳过
+  }
+  // 旧记录：码原文清掉了但领取记录里还留着，也要比
+  const norms = codes.map(normalizeCode)
+  const { results: old } = await db
+    .prepare(
+      `SELECT x.code FROM claims x
+        WHERE x.product_key = ?1 AND x.code IS NOT NULL
+          AND lower(replace(replace(replace(replace(x.code, ' ', ''), char(9), ''), char(10), ''), char(13), ''))
+              IN (SELECT value FROM json_each(?2))`,
+    )
+    .bind(productKey, JSON.stringify(norms))
+    .all<{ code: string }>()
+  if (old.length) {
+    const i = norms.indexOf(normalizeCode(old[0].code))
+    return { block: { reason: 'used_code', message: `「${codes[i >= 0 ? i : 0]}」已经被领过，不能再分享` }, skip }
+  }
+  return { block: null, skip }
+}
 
 app.post('/codes', async (c) => {
   const user = requireUser(c)
@@ -696,18 +868,29 @@ app.post('/codes', async (c) => {
     return fail(c, 429, 'share_limit', `24 小时内最多分享 ${maxShares} 个码`)
   }
 
+  // 重复码校验：领过的、被确认无效的、别人正在分享的码都不能再放进来（大小写、空格不同也算同一个）
+  await backfillCodeHashes(c.env)
+  const hashes = await Promise.all(codes.map((x) => codeHash(x)))
+  for (let i = 0; i < codes.length; i++) {
+    const j = hashes.indexOf(hashes[i])
+    if (j !== i) return fail(c, 400, 'duplicate_in_batch', `「${codes[j]}」和「${codes[i]}」是同一个码`)
+  }
+  const check = await findBlockedCodes(c.env.DB, product.key, codes, hashes)
+  if (check.block) return fail(c, 409, check.block.reason, check.block.message)
+
   const ids = codes.map(() => crypto.randomUUID())
-  const res = await c.env.DB.batch(
-    codes.map((code, i) =>
+  const fresh = codes.map((_, i) => i).filter((i) => !check.skip.has(hashes[i]))
+  const res = !fresh.length ? [] : await c.env.DB.batch(
+    fresh.map((i) =>
       c.env.DB.prepare(
-        `INSERT OR IGNORE INTO codes (id, sharer_id, product_key, code, note, status, created_at, max_uses)
-         VALUES (?, ?, ?, ?, ?, 'available', ?, ?)`,
-      ).bind(ids[i], user.id, product.key, code, note, t, uses),
+        `INSERT OR IGNORE INTO codes (id, sharer_id, product_key, code, note, status, created_at, max_uses, code_hash)
+         VALUES (?, ?, ?, ?, ?, 'available', ?, ?, ?)`,
+      ).bind(ids[i], user.id, product.key, codes[i], note, t, uses, hashes[i]),
     ),
   )
   const added = res.reduce((a, r) => a + (r.meta.changes ?? 0), 0)
   // 放回了自己的码：这个产品已用来领码的押金记下这个码，等它被别人领走后退押金
-  const firstNew = ids.find((_, i) => res[i].meta.changes)
+  const firstNew = fresh.map((i) => ids[i]).find((_, k) => res[k].meta.changes)
   let relayed = 0
   if (firstNew) {
     const r = await c.env.DB.prepare(
@@ -1200,6 +1383,7 @@ async function grantCode(
       WHERE c.product_key = ?4 AND c.status = 'available' AND c.sharer_id <> ?2 AND p.active = 1
         AND ${REMAINING} > 0
         AND NOT EXISTS (SELECT 1 FROM claims y WHERE y.user_id = ?2 AND y.product_key = ?4 AND y.void_at IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM claims v WHERE v.user_id = ?2 AND v.code_id = c.id)
         AND (SELECT COUNT(*) FROM claims z WHERE z.user_id = ?2 AND z.claimed_at > ?5) < ?6
       ORDER BY (SELECT COUNT(*) FROM claims s WHERE s.sharer_id = c.sharer_id AND s.product_key = c.product_key),
                random()
@@ -1440,6 +1624,119 @@ app.post('/claims/:id/report', async (c) => {
   return c.json({ ok: true })
 })
 
+// 确认一个码无效（管理员确认，或领取人自己退还的一次性码）：
+// 领到它的人押金回到「已付」、领取作废；拿它接力的人要重新放回；码作废，没发的奖励取消。
+function invalidateCode(db: D1Database, codeId: string, t: number, by: number | null) {
+  return [
+    db
+      .prepare(
+        `UPDATE relay_deposits SET status = 'paid', claim_id = NULL, relay_code_id = NULL, updated_at = ?1
+          WHERE status = 'used'
+            AND claim_id IN (SELECT claim_id FROM reports WHERE code_id = ?2 AND status = 'open')`,
+      )
+      .bind(t, codeId),
+    db
+      .prepare(
+        `UPDATE relay_deposits SET status = 'used', relay_code_id = NULL, refund_due_at = NULL, updated_at = ?
+          WHERE relay_code_id = ? AND status IN ('used', 'refund_due')`,
+      )
+      .bind(t, codeId),
+    db
+      .prepare(
+        `UPDATE claims SET void_at = ?1
+          WHERE void_at IS NULL
+            AND id IN (SELECT claim_id FROM reports WHERE code_id = ?2 AND status = 'open')`,
+      )
+      .bind(t, codeId),
+    db
+      .prepare(
+        "UPDATE reports SET status = 'confirmed', resolved_at = ?, resolved_by = ? WHERE code_id = ? AND status = 'open'",
+      )
+      .bind(t, by, codeId),
+    db
+      .prepare(
+        "UPDATE codes SET status = 'withdrawn', code = NULL, invalid_at = ? WHERE id = ? AND status <> 'withdrawn'",
+      )
+      .bind(t, codeId),
+    db
+      .prepare(
+        "UPDATE payouts SET status = 'canceled', updated_at = ? WHERE code_id = ? AND status IN ('pending', 'held', 'failed')",
+      )
+      .bind(t, codeId),
+  ]
+}
+
+// 领到的码用不了，领取人可以自己退还：领到后 24 小时内，30 天内最多 3 次。
+const RETURN_WINDOW_MS = 24 * 60 * 60 * 1000
+const RETURNS_PER_30_DAYS = 3
+
+app.post('/claims/:id/return', async (c) => {
+  const user = requireUser(c)
+  if (!user) return fail(c, 401, 'login_required', '请先登录')
+  const body = await c.req.json<{ reason?: string }>().catch(() => null)
+  const reason = (body?.reason ?? '').trim().slice(0, LIMITS.reason) || null
+  const db = c.env.DB
+  const claim = await db
+    .prepare(
+      `SELECT x.id, x.code_id, x.product_key, x.sharer_id, x.claimed_at, p.mode
+         FROM claims x JOIN products p ON p.key = x.product_key
+        WHERE x.id = ? AND x.user_id = ? AND x.void_at IS NULL`,
+    )
+    .bind(c.req.param('id'), user.id)
+    .first<{ id: string; code_id: string; product_key: string; sharer_id: number; claimed_at: number; mode: Mode }>()
+  if (!claim) return fail(c, 404, 'not_found', '没有这条领取记录，或已经退还过了')
+  const t = now()
+  if (claim.claimed_at < t - RETURN_WINDOW_MS) {
+    return fail(c, 409, 'return_expired', '领到超过 24 小时了，不能自己退还；可以点「码用不了？」反馈给管理员')
+  }
+  const prior = await db
+    .prepare('SELECT status FROM reports WHERE claim_id = ?')
+    .bind(claim.id)
+    .first<{ status: string }>()
+  if (prior && prior.status !== 'open') {
+    return fail(c, 409, 'already_reviewed', '管理员已经处理过这个码的反馈，不能再退还')
+  }
+  const used = await db
+    .prepare('SELECT COUNT(*) AS n FROM reports WHERE reporter_id = ? AND self_return = 1 AND created_at > ?')
+    .bind(user.id, t - 30 * DAY)
+    .first<{ n: number }>()
+  if ((used?.n ?? 0) >= RETURNS_PER_30_DAYS) {
+    return fail(c, 429, 'return_limit', `30 天内最多自己退还 ${RETURNS_PER_30_DAYS} 次，这次请点「码用不了？」反馈给管理员`)
+  }
+  if (prior) {
+    await db
+      .prepare('UPDATE reports SET self_return = 1, created_at = ?, reason = COALESCE(?, reason) WHERE claim_id = ?')
+      .bind(t, reason, claim.id)
+      .run()
+  } else {
+    await db
+      .prepare(
+        `INSERT INTO reports (id, claim_id, code_id, product_key, reporter_id, sharer_id, reason, status, created_at, self_return)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, 1)`,
+      )
+      .bind(crypto.randomUUID(), claim.id, claim.code_id, claim.product_key, user.id, claim.sharer_id, reason, t)
+      .run()
+  }
+  if (claim.mode === 'single') {
+    // 一次性码：直接作废，不会再发给别人
+    await db.batch(invalidateCode(db, claim.code_id, t, null))
+  } else {
+    // 多人可用码：只作废我这次领取，码本身留给管理员判断；码上没发的奖励先扣下
+    await db.batch([
+      db
+        .prepare(
+          "UPDATE relay_deposits SET status = 'paid', claim_id = NULL, relay_code_id = NULL, updated_at = ? WHERE claim_id = ? AND status = 'used'",
+        )
+        .bind(t, claim.id),
+      db.prepare('UPDATE claims SET void_at = ? WHERE id = ? AND void_at IS NULL').bind(t, claim.id),
+      db
+        .prepare("UPDATE payouts SET status = 'held', updated_at = ? WHERE code_id = ? AND status IN ('pending', 'failed')")
+        .bind(t, claim.code_id),
+    ])
+  }
+  return c.json({ ok: true, invalidated: claim.mode === 'single' })
+})
+
 // ---------- 申请新产品 ----------
 
 const REQUEST_COLUMNS = `r.id, r.name, r.product_key, r.mode, r.max_uses, r.description, r.status, r.admin_note,
@@ -1573,7 +1870,7 @@ app.get('/my/claimed', async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT x.id, x.product_key, p.name AS product, p.mode, x.code, c.note, x.claimed_at, x.thanked_at, x.void_at,
             u.username AS sharer_username, u.avatar_url AS sharer_avatar,
-            r.status AS report_status,
+            r.status AS report_status, r.self_return AS self_returned,
             d.id AS deposit_id, d.status AS deposit_status, d.amount_cents AS deposit_cents,
             d.relay_code_id IS NOT NULL AS relayed, d.refund_due_at
        FROM claims x
@@ -1737,7 +2034,7 @@ admin.delete('/codes/:id', async (c) => {
 admin.get('/reports', async (c) => {
   const status = c.req.query('status') ?? 'open'
   const { results } = await c.env.DB.prepare(
-    `SELECT r.id, r.code_id, r.claim_id, r.reason, r.status, r.created_at, r.resolved_at,
+    `SELECT r.id, r.code_id, r.claim_id, r.reason, r.status, r.self_return, r.created_at, r.resolved_at,
             p.name AS product, p.mode, x.code, c.status AS code_status,
             ru.username AS reporter_username, ru.avatar_url AS reporter_avatar,
             su.username AS sharer_username, su.avatar_url AS sharer_avatar,
@@ -1774,45 +2071,7 @@ admin.post('/reports/:id/resolve', async (c) => {
   const by = c.get('user')!.id
   const db = c.env.DB
   if (action === 'confirm') {
-    await db.batch([
-      // 领到这个无效码的人：押金回到「已付」，可以再领一个或退回
-      db
-        .prepare(
-          `UPDATE relay_deposits SET status = 'paid', claim_id = NULL, relay_code_id = NULL, updated_at = ?1
-            WHERE status = 'used'
-              AND claim_id IN (SELECT claim_id FROM reports WHERE code_id = ?2 AND status = 'open')`,
-        )
-        .bind(t, report.code_id),
-      // 拿这个无效码来接力的人：接力不算，要重新放回有效的码
-      db
-        .prepare(
-          `UPDATE relay_deposits SET status = 'used', relay_code_id = NULL, refund_due_at = NULL, updated_at = ?
-            WHERE relay_code_id = ? AND status IN ('used', 'refund_due')`,
-        )
-        .bind(t, report.code_id),
-      db
-        .prepare(
-          `UPDATE claims SET void_at = ?1
-            WHERE void_at IS NULL
-              AND id IN (SELECT claim_id FROM reports WHERE code_id = ?2 AND status = 'open')`,
-        )
-        .bind(t, report.code_id),
-      db
-        .prepare(
-          "UPDATE reports SET status = 'confirmed', resolved_at = ?, resolved_by = ? WHERE code_id = ? AND status = 'open'",
-        )
-        .bind(t, by, report.code_id),
-      db
-        .prepare(
-          "UPDATE codes SET status = 'withdrawn', code = NULL, invalid_at = ? WHERE id = ? AND status <> 'withdrawn'",
-        )
-        .bind(t, report.code_id),
-      db
-        .prepare(
-          "UPDATE payouts SET status = 'canceled', updated_at = ? WHERE code_id = ? AND status IN ('pending', 'held', 'failed')",
-        )
-        .bind(t, report.code_id),
-    ])
+    await db.batch(invalidateCode(db, report.code_id, t, by))
   } else {
     await db.batch([
       db
@@ -2160,6 +2419,7 @@ export default {
     if (e.cron === '0 19 * * *') {
       await env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(now()).run()
     }
+    await backfillCodeHashes(env, 500)
     await serveAllQueues(env)
     await runPayouts(env)
     await runRefunds(env)

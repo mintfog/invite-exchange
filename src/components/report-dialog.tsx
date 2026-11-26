@@ -15,20 +15,42 @@ import { Textarea } from '@/components/ui/textarea'
 
 import { api, ApiError } from '@/lib/api'
 
-// 领取人反馈「这个码用不了」
+// 领取人反馈「这个码用不了」。领到 24 小时内可以直接退还，不用等管理员。
 export function ReportDialog({
   claimId,
   product,
+  returnable = false,
+  onlyReturn = false,
   onClose,
   onDone,
 }: {
   claimId: string | null
   product?: string
+  /** 还能自己退还（领到 24 小时内） */
+  returnable?: boolean
+  /** 已经反馈过了，只剩退还可选 */
+  onlyReturn?: boolean
   onClose: () => void
   onDone: () => void
 }) {
   const [reason, setReason] = useState('')
   const [busy, setBusy] = useState(false)
+
+  const doReturn = async () => {
+    if (!claimId) return
+    setBusy(true)
+    try {
+      const r = await api.returnClaim(claimId, reason)
+      toast(r.invalidated ? '已退还，这个码作废了，你可以去广场再领一个' : '已退还，你可以去广场再领一个')
+      setReason('')
+      onDone()
+      onClose()
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : '没退还成功')
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const submit = async () => {
     if (!claimId) return
@@ -50,9 +72,11 @@ export function ReportDialog({
     <Dialog open={!!claimId} onOpenChange={(o) => !o && onClose()}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>反馈{product ? ` ${product} ` : ''}邀请码无效</DialogTitle>
+          <DialogTitle>{product ? `${product} 的` : ''}邀请码用不了？</DialogTitle>
           <DialogDescription>
-            管理员会核实。确认无效后，这个码会被撤下，分享者拿不到奖励，你也可以再领一个。
+            {returnable
+              ? '可以直接退还：这次领取作废，码不会再发给别人，分享者拿不到这个码的奖励；付过押金的话押金回到「已付」，可以再领一个或退回。30 天内最多自己退还 3 次，请只在码确实用不了时退还。'
+              : '管理员会核实。确认无效后，这个码会被撤下，分享者拿不到奖励，你也可以再领一个。'}
           </DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-2">
@@ -69,9 +93,20 @@ export function ReportDialog({
           <Button variant="outline" onClick={onClose}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy}>
-            {busy ? '提交中…' : '提交反馈'}
-          </Button>
+          {returnable && !onlyReturn ? (
+            <Button variant="outline" onClick={submit} disabled={busy}>
+              只反馈给管理员
+            </Button>
+          ) : null}
+          {returnable ? (
+            <Button onClick={doReturn} disabled={busy}>
+              {busy ? '退还中…' : '退还这个码'}
+            </Button>
+          ) : (
+            <Button onClick={submit} disabled={busy}>
+              {busy ? '提交中…' : '提交反馈'}
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

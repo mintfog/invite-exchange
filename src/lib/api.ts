@@ -118,6 +118,8 @@ export type Claim = {
   thanked_at: number | null
   void_at: number | null
   report_status: 'open' | 'confirmed' | 'dismissed' | null
+  /** 1 = 我自己退还的 */
+  self_returned: number | null
   sharer_username: string
   sharer_avatar: string | null
   deposit_id: string | null
@@ -252,6 +254,8 @@ export type Report = {
   claim_id: string
   reason: string | null
   status: 'open' | 'confirmed' | 'dismissed'
+  /** 1 = 领取人自己退还的 */
+  self_return: number
   created_at: number
   resolved_at: number | null
   product: string
@@ -276,6 +280,17 @@ export type Settings = {
   relay_enabled: boolean
   relay_deposit_cents: number
   queue_premium_cents: number
+}
+
+export type Chain = {
+  /** pool = 码在池子里等人领；waiting = 码在链尾的人手里，等 TA 放回自己的码 */
+  state: 'pool' | 'waiting'
+  /** 链上一共几个人 */
+  length: number
+  /** 前面没画出来的人数 */
+  earlier: number
+  /** 链上的人，只有头像（本站匿名地址），没有名字 */
+  nodes: { avatar: string | null; me: boolean }[]
 }
 
 export type QueueWaiting = {
@@ -393,6 +408,9 @@ export const api = {
   claim: (product_key: string) => post<{ claim: NewClaim }>('/claim', { product_key }),
   thank: (id: string) => post<{ ok: true }>(`/claims/${id}/thanks`),
   report: (id: string, reason: string) => post<{ ok: true }>(`/claims/${id}/report`, { reason }),
+  returnClaim: (id: string, reason: string) =>
+    post<{ ok: true; invalidated: boolean }>(`/claims/${id}/return`, { reason }),
+  chains: (key: string) => request<{ chains: Chain[]; relays: number }>(`/products/${encodeURIComponent(key)}/chains`),
   myShared: () =>
     request<{ codes: SharedCode[]; claimers: Claimer[]; summary: SharedSummary; payouts: MyPayout[] }>('/my/shared'),
   myClaimed: () => request<{ claims: Claim[] }>('/my/claimed'),

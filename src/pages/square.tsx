@@ -20,6 +20,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 
 import { CopyButton } from '@/components/copy-button'
 import { ReportDialog } from '@/components/report-dialog'
+import { ChainDialog } from '@/components/chain-dialog'
 import { prepareQueueAlerts } from '@/lib/queue-alerts'
 import {
   api,
@@ -53,6 +54,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
   const [requesting, setRequesting] = useState(false)
   const [depositFor, setDepositFor] = useState<Product | null>(null)
   const [queueFor, setQueueFor] = useState<Product | null>(null)
+  const [chainFor, setChainFor] = useState<Product | null>(null)
   const [paying, setPaying] = useState(false)
 
   useEffect(() => {
@@ -208,7 +210,11 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {shown.map((p) => (
-              <Card key={p.key}>
+              <Card
+                key={p.key}
+                className={p.deposit_base_cents !== null ? 'cursor-pointer transition-colors hover:border-foreground/30' : undefined}
+                onClick={p.deposit_base_cents !== null ? () => setChainFor(p) : undefined}
+              >
                 <CardHeader>
                   <CardTitle className="truncate">{p.name}</CardTitle>
                   <CardDescription className="line-clamp-2">
@@ -246,10 +252,17 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
                   <RelayLine product={p} />
                   {p.deposit_base_cents !== null ? (
                     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-foreground">
-                      <span className="flex items-center gap-1">
+                      <Button
+                        variant="link"
+                        className="h-auto gap-1 p-0 text-foreground"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setChainFor(p)
+                        }}
+                      >
                         <Link2 className="size-4" />
-                        当前 {p.relay_chains} 条接力链
-                      </span>
+                        当前 {p.relay_chains} 条接力链，点开看
+                      </Button>
                       {p.queue_count > 0 ? (
                         <span className="flex items-center gap-1">
                           <Users className="size-4" />
@@ -266,7 +279,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
                     </span>
                   ) : null}
                 </CardContent>
-                <CardFooter>
+                <CardFooter onClick={(e) => e.stopPropagation()}>
                   <ClaimButton
                     product={p}
                     user={user}
@@ -343,6 +356,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
       <ReportDialog
         claimId={reporting?.id ?? null}
         product={reporting?.product}
+        returnable
         onClose={() => setReporting(null)}
         onDone={onChanged}
       />
@@ -403,6 +417,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
         </DialogContent>
       </Dialog>
 
+      <ChainDialog product={chainFor} onClose={() => setChainFor(null)} />
       <RequestProductDialog open={requesting} initialName={query.trim()} onClose={() => setRequesting(false)} />
     </div>
   )

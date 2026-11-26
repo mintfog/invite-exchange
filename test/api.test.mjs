@@ -1083,12 +1083,114 @@ try {
     assert.equal((await qview(qB)).queue_count, 0)
     assert.equal((await qview(qB)).my_queue_pos, null)
     ok('没排到可以取消排队，押金全部退回')
+    // 接力链图：q-seed → q-d1 → q-d2 → q-d3 → q-a，码（Q-A）在池子里；只给头像不给名字
+    const ch = await qA.json(`/api/products/${qk}/chains`)
+    assert.equal(ch.status, 200)
+    assert.equal(ch.data.chains.length, 1)
+    assert.equal(ch.data.relays, 4)
+    const c0 = ch.data.chains[0]
+    assert.equal(c0.state, 'pool')
+    assert.equal(c0.length, 5)
+    assert.equal(c0.nodes.length, 5)
+    assert.deepEqual(c0.nodes.map((n) => n.me), [false, false, false, false, true])
+    const raw = JSON.stringify(ch.data)
+    for (const name of ['q-seed', 'q-d1', 'q-a', 'username']) assert.ok(!raw.includes(name), name)
+    assert.equal((await new Client().json(`/api/products/${qk}/chains`)).data.chains.length, 1)
+    assert.equal((await fetch(`${BASE}/api/avatars/nope`)).status, 404)
+    ok('接力链图：一条链走到第 5 个人，码在池子里；只给头像，不带名字')
+
     await boss.json('/api/admin/settings', 'PUT', { queue_premium_cents: 20000 })
 
     await boss.json('/api/admin/settings', 'PUT', { relay_enabled: false, hold_hours: 24 })
     const off = (await r1.json('/api/products')).data.products.find((p) => p.key === key)
     assert.equal(off.deposit_cents, null)
     ok('关掉接力后不再收押金')
+  }
+
+  console.log('重复码校验')
+  {
+    const dk = (await boss.json('/api/admin/products', 'POST', { name: 'Dup', mode: 'single' })).data.key
+    const [d1, d2, d3] = await Promise.all(['dup1', 'dup2', 'dup3'].map((n) => new Client().devLogin(n)))
+    const share = (cl, codes) => cl.json('/api/codes', 'POST', { product_key: dk, codes })
+    assert.equal((await share(d1, 'DUP-1')).data.added, 1)
+    const other = await share(d2, ' dup-1 \nDUP-OK')
+    assert.equal(other.status, 200)
+    assert.equal(other.data.added, 1)
+    assert.equal(other.data.duplicates, 1)
+    const again = await share(d1, 'dup-1')
+    assert.equal(again.status, 200)
+    assert.equal(again.data.added, 0)
+    assert.equal(again.data.duplicates, 1)
+    assert.equal((await share(d1, 'X-9\nx-9')).data.error, 'duplicate_in_batch')
+    ok('池子里已有的码（大小写、空格不同也算同一个）再放算重复跳过')
+
+    const d2id = (await d2.json('/api/my/shared')).data.codes.find((x) => x.code === 'DUP-OK').id
+    assert.equal((await d2.json(`/api/codes/${d2id}`, 'DELETE')).status, 200)
+    assert.equal((await d3.json('/api/claim', 'POST', { product_key: dk })).data.claim.code, 'DUP-1')
+    const back = await share(d3, 'DUP-1')
+    assert.equal(back.status, 409)
+    assert.equal(back.data.error, 'used_code')
+    assert.equal((await share(d1, 'Dup-1')).data.error, 'used_code')
+    assert.equal((await share(d2, 'dup 1'.replace(' ', '-'))).data.error, 'used_code')
+    ok('领过的码不能再放回池子：领的人放不回，原分享者和别人也放不回（防止两个号来回倒）')
+
+    assert.equal((await share(d1, 'DUP-2')).data.added, 1)
+    const id2 = (await d1.json('/api/my/shared')).data.codes.find((x) => x.code === 'DUP-2').id
+    assert.equal((await d1.json(`/api/codes/${id2}`, 'DELETE')).status, 200)
+    assert.equal((await share(d1, 'dup-2')).data.added, 1)
+    ok('自己撤回、没人领过的码可以重新放回')
+  }
+
+  console.log('领到的码用不了，自己退还')
+  {
+    const rk = (await boss.json('/api/admin/products', 'POST', { name: 'Ret', mode: 'single' })).data.key
+    const rs = await new Client().devLogin('ret-sharer')
+    const ru = await new Client().devLogin('ret-user')
+    const rv = await new Client().devLogin('ret-v')
+    await rs.json('/api/codes', 'POST', { product_key: rk, codes: 'RET-1\nRET-2\nRET-3\nRET-4\nRET-5\nRET-6' })
+    const c1 = (await ru.json('/api/claim', 'POST', { product_key: rk })).data.claim
+    assert.equal((await rv.json(`/api/claims/${c1.id}/return`, 'POST')).status, 404)
+    const r1 = await ru.json(`/api/claims/${c1.id}/return`, 'POST', { reason: '提示无效' })
+    assert.equal(r1.status, 200, JSON.stringify(r1.data))
+    assert.equal(r1.data.invalidated, true)
+    assert.equal((await ru.json(`/api/claims/${c1.id}/return`, 'POST')).status, 404)
+    const mine = (await ru.json('/api/my/claimed')).data.claims.find((x) => x.id === c1.id)
+    assert.ok(mine.void_at)
+    assert.equal(mine.self_returned, 1)
+    const shared = (await rs.json('/api/my/shared')).data.codes
+    assert.ok(!shared.some((x) => x.code === c1.code && x.status === 'available'))
+    const c2 = (await ru.json('/api/claim', 'POST', { product_key: rk })).data.claim
+    assert.ok(c2 && c2.code !== c1.code)
+    assert.equal((await ru.json('/api/codes', 'POST', { product_key: rk, codes: c1.code })).data.error, 'used_code')
+    const reps = (await boss.json('/api/admin/reports?status=all')).data.reports
+    const rep = reps.find((x) => x.claim_id === c1.id)
+    assert.equal(rep.status, 'confirmed')
+    assert.equal(rep.self_return, 1)
+    ok('一次性码自己退还：领取作废、码作废不再发给别人，可以再领一个；管理员能看到是自己退还的')
+
+    for (let i = 0; i < 3; i++) {
+      const c = (await rv.json('/api/claim', 'POST', { product_key: rk })).data.claim
+      assert.equal((await rv.json(`/api/claims/${c.id}/return`, 'POST')).status, 200)
+    }
+    const c4 = (await rv.json('/api/claim', 'POST', { product_key: rk })).data.claim
+    const lim = await rv.json(`/api/claims/${c4.id}/return`, 'POST')
+    assert.equal(lim.status, 429)
+    assert.equal(lim.data.error, 'return_limit')
+    ok('30 天内最多自己退还 3 次，超过要反馈给管理员')
+
+    const mk = (await boss.json('/api/admin/products', 'POST', { name: 'RetMulti', mode: 'multi', max_uses: 3 })).data.key
+    const ms = await new Client().devLogin('retm-sharer')
+    const mu = await new Client().devLogin('retm-user')
+    await ms.json('/api/codes', 'POST', { product_key: mk, codes: 'MULTI-1' })
+    const mc = (await mu.json('/api/claim', 'POST', { product_key: mk })).data.claim
+    const mr = await mu.json(`/api/claims/${mc.id}/return`, 'POST')
+    assert.equal(mr.data.invalidated, false)
+    assert.equal((await mu.json('/api/claim', 'POST', { product_key: mk })).data.error, 'empty')
+    const mrep = (await boss.json('/api/admin/reports?status=open')).data.reports.find((x) => x.claim_id === mc.id)
+    assert.equal(mrep.self_return, 1)
+    const mv = await new Client().devLogin('retm-v')
+    assert.equal((await mv.json('/api/claim', 'POST', { product_key: mk })).data.claim.code, 'MULTI-1')
+    ok('多人可用码自己退还：只作废自己这次，码留给管理员判断；退还后不能再领同一个码')
   }
 
   console.log(`\n全部通过：${passed} 项`)

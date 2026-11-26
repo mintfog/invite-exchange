@@ -212,7 +212,10 @@ function ReportsPanel({ version, onChanged }: { version: number; onChanged: () =
                   </TableCell>
                   <TableCell>
                     <UserCell name={r.reporter_username} avatar={r.reporter_avatar} />
-                    <span className="text-xs text-muted-foreground">{timeAgo(r.created_at)}</span>
+                    <span className="text-xs text-muted-foreground">
+                      {r.self_return ? '自己退还 · ' : ''}
+                      {timeAgo(r.created_at)}
+                    </span>
                   </TableCell>
                   <TableCell>
                     <UserCell name={r.sharer_username} avatar={r.sharer_avatar} />

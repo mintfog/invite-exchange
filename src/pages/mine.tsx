@@ -334,7 +334,9 @@ export function MinePage({ user, version, onChanged }: Props) {
                       <code className="truncate rounded-md bg-muted px-2 py-1 font-mono text-sm">{c.code}</code>
                       {c.note ? <span className="text-xs text-muted-foreground">留言：{c.note}</span> : null}
                       {c.void_at ? (
-                        <span className="text-xs text-muted-foreground">这个码已确认无效，可以去广场再领一个。</span>
+                        <span className="text-xs text-muted-foreground">
+                          {c.self_returned ? '你已退还这个码' : '这个码已确认无效'}，可以去广场再领一个。
+                        </span>
                       ) : null}
                       <DepositNote claim={c} />
                     </div>
@@ -344,9 +346,9 @@ export function MinePage({ user, version, onChanged }: Props) {
                         <Heart className={c.thanked_at ? 'fill-foreground' : undefined} />
                         {c.thanked_at ? '已感谢' : '感谢'}
                       </Button>
-                      {!c.report_status && !c.void_at ? (
+                      {!c.void_at && (!c.report_status || (c.report_status === 'open' && returnable(c))) ? (
                         <Button variant="ghost" size="sm" onClick={() => setReporting(c)}>
-                          用不了
+                          {c.report_status ? '退还' : '用不了'}
                         </Button>
                       ) : null}
                     </div>
@@ -529,6 +531,8 @@ export function MinePage({ user, version, onChanged }: Props) {
       <ReportDialog
         claimId={reporting?.id ?? null}
         product={reporting?.product}
+        returnable={reporting ? returnable(reporting) : false}
+        onlyReturn={reporting?.report_status === 'open'}
         onClose={() => setReporting(null)}
         onDone={onChanged}
       />
@@ -550,7 +554,12 @@ function DepositNote({ claim: c }: { claim: Claim }) {
   return <span className="text-xs text-foreground">{text}</span>
 }
 
+// 领到 24 小时内可以自己退还
+const returnable = (c: Claim) =>
+  !c.void_at && c.report_status !== 'dismissed' && c.claimed_at > Date.now() - 24 * 60 * 60 * 1000
+
 function ReportBadge({ claim }: { claim: Claim }) {
+  if (claim.self_returned && claim.void_at) return <Badge variant="destructive">已退还</Badge>
   if (claim.void_at || claim.report_status === 'confirmed') return <Badge variant="destructive">已确认无效</Badge>
   if (claim.report_status === 'open') return <Badge variant="outline">已反馈，等待处理</Badge>
   if (claim.report_status === 'dismissed') return <Badge variant="secondary">反馈未通过</Badge>
