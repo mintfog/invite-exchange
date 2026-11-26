@@ -1170,6 +1170,24 @@ app.post('/claim', async (c) => {
     )
       .bind(t + s.hold_hours * 60 * 60 * 1000, t, row.code_id)
       .run()
+    // 接力链：A 分享 → B 领了 A 的码 → B 放回自己的码 → 现在被领走。
+    // 说明 B 用 A 的码注册成功了，A 的押金不用再等观察期，马上退。
+    const proven = await c.env.DB.prepare(
+      `UPDATE relay_deposits SET refund_due_at = ?1, updated_at = ?1
+        WHERE status = 'refund_due' AND refund_due_at > ?1
+          AND relay_code_id IN (
+            SELECT x.code_id FROM claims x JOIN codes k ON k.id = ?2
+             WHERE x.user_id = k.sharer_id AND x.product_key = k.product_key AND x.void_at IS NULL)`,
+    )
+      .bind(t, row.code_id)
+      .run()
+    if (proven.meta.changes) {
+      try {
+        c.executionCtx.waitUntil(runRefunds(c.env))
+      } catch {
+        // 没有执行上下文（比如测试里）就等定时任务
+      }
+    }
     const info = await c.env.DB.prepare(
       `SELECT c.note, p.name AS product, p.mode, u.username AS sharer_username
          FROM codes c JOIN products p ON p.key = c.product_key JOIN users u ON u.id = c.sharer_id

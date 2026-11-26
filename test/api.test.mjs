@@ -906,6 +906,50 @@ try {
     assert.equal((await r4.json('/api/my/deposits')).data.deposits[0].status, 'refunded')
     ok('管理员能看所有押金、手动退回或没收')
 
+    // 接力链：A 的码被 B 领走（押金等观察期），B 放回的码又被 C 领走 → A 的押金马上退
+    await boss.json('/api/admin/settings', 'PUT', { hold_hours: 24 })
+    const chain = await mkChainProduct()
+    async function mkChainProduct() {
+      const r = await boss.json('/api/admin/products', 'POST', { name: 'Chain', mode: 'single', relay_required: true })
+      return r.data.key
+    }
+    const ca = await new Client().devLogin('chainA')
+    const cb = await new Client().devLogin('chainB')
+    const cc = await new Client().devLogin('chainC')
+    const seed = await new Client().devLogin('chain-seed')
+    await seed.json('/api/codes', 'POST', { product_key: chain, codes: 'CHAIN-0' })
+    const payFor = async (cl) => {
+      const r = await cl.json(`/api/products/${chain}/deposit`, 'POST')
+      const q = Object.fromEntries(new URL(r.data.url).searchParams)
+      await notify(q)
+      return q
+    }
+    const qa = await payFor(ca)
+    assert.equal((await ca.json('/api/claim', 'POST', { product_key: chain })).data.claim.code, 'CHAIN-0')
+    await ca.json('/api/codes', 'POST', { product_key: chain, codes: 'CHAIN-A' })
+    await payFor(cb)
+    assert.equal((await cb.json('/api/claim', 'POST', { product_key: chain })).data.claim.code, 'CHAIN-A')
+    await cb.json('/api/codes', 'POST', { product_key: chain, codes: 'CHAIN-B' })
+    const depA = async () => (await ca.json('/api/my/deposits')).data.deposits[0]
+    assert.equal((await depA()).status, 'refund_due')
+    assert.ok((await depA()).refund_due_at > Date.now() + 23 * 3600 * 1000)
+    assert.equal((await boss.json('/api/admin/deposits/run', 'POST')).data.refunded, 0)
+    await payFor(cc)
+    assert.equal((await cc.json('/api/claim', 'POST', { product_key: chain })).data.claim.code, 'CHAIN-B')
+    let a = await depA()
+    for (let i = 0; i < 20 && a.status !== 'refunded'; i++) {
+      await new Promise((r) => setTimeout(r, 100))
+      a = await depA()
+    }
+    if (a.status !== 'refunded') await boss.json('/api/admin/deposits/run', 'POST')
+    assert.equal((await depA()).status, 'refunded')
+    assert.ok(refundCalls.some((r) => r.trade_no === `T-${qa.out_trade_no}`))
+    const depB = (await cb.json('/api/my/deposits')).data.deposits[0]
+    assert.equal(depB.status, 'refund_due')
+    assert.ok(depB.refund_due_at > Date.now() + 23 * 3600 * 1000)
+    ok('接力链：B 放回的码被 C 领走，证明 A 的码有效，A 的押金不等观察期马上退；B 的还要等')
+    await boss.json('/api/admin/settings', 'PUT', { hold_hours: 0 })
+
     // 每个产品自己的押金、最低等级、分档押金
     const mkp = (b) => boss.json('/api/admin/products', 'POST', b)
     assert.equal((await mkp({ name: 'Bad1', relay_required: true, deposit_cents: 0 })).data.error, 'bad_deposit')
