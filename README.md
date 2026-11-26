@@ -59,10 +59,19 @@ npx wrangler secret put LINUXDO_CLIENT_SECRET
 
 ### 4. 部署
 
-二选一：
+**自动部署（已配好）**：推到 `main` 分支后，GitHub Actions（`.github/workflows/deploy.yml`）会依次跑类型检查、构建、接口测试，全部通过才迁移远端 D1 并 `wrangler deploy`。PR 只跑测试、不部署。也可以在仓库 Actions 页手动触发。
 
-- **A. Cloudflare 云端构建（推荐，不占本机资源）**：把代码推到 GitHub，在 Cloudflare 控制台 Workers & Pages → Create → Import a repository，构建命令填 `npm run build`，部署命令填 `npx wrangler deploy`。构建时会自动装 shadcn 组件。
-- **B. 本机部署**：`npm run deploy`（先构建再 `wrangler deploy`）。
+第一次用之前，要给仓库加一个密钥 `CLOUDFLARE_API_TOKEN`：
+
+1. Cloudflare 控制台 → My Profile → API Tokens → Create Token，选模板 **Edit Cloudflare Workers**。
+2. 在权限里再加一行 **Account → D1 → Edit**；Account Resources 只选你自己的账号，Zone Resources 选 `fshark.cloud`。
+3. 生成后复制令牌，在 Mac 终端运行下面这条，按提示粘贴：
+
+```bash
+gh secret set CLOUDFLARE_API_TOKEN -R WilliamWang1721/invite-exchange
+```
+
+**手动部署**：`npm run deploy`（先构建再 `wrangler deploy`）。
 
 ### 5. 绑定自己的域名（国内访问建议做）
 
@@ -81,9 +90,7 @@ npm run dev
 ## 接口测试
 
 ```bash
-npx wrangler d1 migrations apply invite-exchange --local -c test/wrangler.test.jsonc --persist-to .wrangler-test
-npx wrangler dev -c test/wrangler.test.jsonc --persist-to .wrangler-test --port 8799 --var LINUXDO_BASE:http://127.0.0.1:8800
-node test/api.test.mjs   # 另开一个终端
+npm test   # 自动起本地 wrangler dev、跑 test/api.test.mjs，跑完关掉
 ```
 
 覆盖：LinuxDO OAuth 全流程（用本地假服务）、分享去重、码对外隐藏、原子领取和并发、感谢、撤回、各项限额。
