@@ -157,6 +157,11 @@ export type AdminUser = {
   received: number
   is_admin: boolean
   is_test: boolean
+  /** 待发 + 发送失败的奖励（分） */
+  unpaid_cents: number
+  /** 有人反馈无效、被扣下的奖励（分） */
+  held_cents: number
+  sent_cents: number
 }
 
 export type Report = {
@@ -320,6 +325,8 @@ export const api = {
     runPayouts: () => post<RunResult>('/admin/payouts/run'),
     retryPayout: (id: string) => post<{ ok: true }>(`/admin/payouts/${id}/retry`),
     cancelPayout: (id: string) => post<{ ok: true }>(`/admin/payouts/${id}/cancel`),
+    sendPayoutNow: (id: string) => post<RunResult>(`/admin/payouts/${id}/send-now`),
+    sendUserNow: (userId: number) => post<RunResult>(`/admin/users/${userId}/send-now`),
   },
 }
 

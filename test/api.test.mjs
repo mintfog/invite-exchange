@@ -620,6 +620,76 @@ try {
     ok('测试账号分享的码被领取，不会记 LDC 奖励')
   }
 
+  console.log('立即发放（跳过观察期）')
+  {
+    await boss.json('/api/admin/products', 'POST', { name: 'Quick', mode: 'single' })
+    await boss.json('/api/admin/settings', 'PUT', {
+      ldc_enabled: true,
+      share_reward_cents: 100,
+      claim_reward_cents: 0,
+      daily_cap_cents: 1_000_000,
+      hold_hours: 24,
+    })
+    const vip = await new Client().devLogin('vip')
+    const other = await new Client().devLogin('other-sharer')
+    const vipId = (await vip.json('/api/me')).data.user.id
+    const shareRes = await vip.json('/api/codes', 'POST', { product_key: 'quick', codes: 'G-1\nG-2\nG-3' })
+    assert.equal(shareRes.status, 200, JSON.stringify(shareRes.data))
+    for (let i = 0; i < 3; i++) {
+      const r = await (await new Client().devLogin(`gtaker${i}`)).json('/api/claim', 'POST', { product_key: 'quick' })
+      assert.equal(r.status, 200, JSON.stringify(r.data))
+    }
+    await other.json('/api/codes', 'POST', { product_key: 'quick', codes: 'G-9' })
+    await (await new Client().devLogin('gtaker9')).json('/api/claim', 'POST', { product_key: 'quick' })
+    const list = async () =>
+      (await boss.json('/api/admin/payouts')).data.payouts.filter((p) => p.product === 'Quick')
+    const vipPayouts = (await list()).filter((p) => p.sharer_username === 'vip')
+    assert.equal(vipPayouts.length, 3)
+    assert.ok(vipPayouts.every((p) => p.status === 'pending' && p.due_at > Date.now() + 23 * 3600 * 1000))
+    const before = ldcCalls.length
+    await boss.json('/api/admin/payouts/run', 'POST')
+    assert.equal(ldcCalls.length, before)
+    ok('观察期 24 小时内，普通发放不会发')
+
+    assert.equal((await vip.json(`/api/admin/payouts/${vipPayouts[0].id}/send-now`, 'POST')).status, 403)
+    const one = await boss.json(`/api/admin/payouts/${vipPayouts[0].id}/send-now`, 'POST')
+    assert.equal(one.status, 200)
+    assert.equal(one.data.sent, 1)
+    assert.equal(ldcCalls.length, before + 1)
+    assert.equal(ldcCalls.at(-1).out_trade_no, vipPayouts[0].id)
+    assert.equal((await boss.json(`/api/admin/payouts/${vipPayouts[0].id}/send-now`, 'POST')).status, 409)
+    ok('管理员对单笔立即发放：马上发出，只发这一笔，发过的不能再发')
+
+    const users = (await boss.json('/api/admin/users')).data.users
+    const vu = users.find((u) => u.username === 'vip')
+    assert.equal(vu.unpaid_cents, 200)
+    assert.equal(vu.sent_cents, 100)
+    const all = await boss.json(`/api/admin/users/${vipId}/send-now`, 'POST')
+    assert.equal(all.status, 200)
+    assert.equal(all.data.sent, 2)
+    assert.equal(ldcCalls.length, before + 3)
+    assert.ok(ldcCalls.slice(before).every((b) => b.username === 'vip'))
+    const otherP = (await list()).find((p) => p.sharer_username === 'other-sharer')
+    assert.equal(otherP.status, 'pending')
+    assert.equal((await boss.json(`/api/admin/users/${vipId}/send-now`, 'POST')).status, 404)
+    ok('管理员对某个用户立即发放：发完他所有待发的奖励，别人的不受影响')
+
+    // 有人反馈无效的不能立即发
+    const gclaim = (await (await new Client().devLogin('gtaker9')).json('/api/my/claimed')).data.claims[0]
+    const g9 = await new Client().devLogin('gtaker9')
+    await g9.json(`/api/claims/${gclaim.id}/report`, 'POST', { reason: '不能用' })
+    const held = await boss.json(`/api/admin/payouts/${otherP.id}/send-now`, 'POST')
+    assert.equal(held.status, 409)
+    assert.equal(held.data.error, 'held')
+    ok('有人反馈无效、被扣下的奖励不能立即发')
+
+    await boss.json('/api/admin/settings', 'PUT', { ldc_enabled: false })
+    const off = await boss.json(`/api/admin/users/${vipId}/send-now`, 'POST')
+    assert.equal(off.status, 409)
+    assert.equal(off.data.error, 'ldc_disabled')
+    ok('LDC 奖励关闭时不能立即发放')
+  }
+
   console.log('申请新产品')
   {
     const pr = await new Client().devLogin('requester')

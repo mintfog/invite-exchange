@@ -667,7 +667,8 @@ type PayoutJob = {
 const cents = (n: number) => (n / 100).toFixed(2)
 
 // 把到期的奖励发出去。每笔先原子地改成 sending，再调 LDC；全站 24 小时上限也在这条 UPDATE 里检查。
-export async function runPayouts(env: Env, limit = 25) {
+// only：只发这几笔（管理员「立即发放」用），不看其他到期的
+export async function runPayouts(env: Env, limit = 25, only?: string[]) {
   const s = await getSettings(env.DB)
   const out = { configured: ldcConfigured(env), enabled: s.ldc_enabled, sent: 0, failed: 0, waiting: 0 }
   if (!out.configured || !s.ldc_enabled) return out
@@ -683,11 +684,12 @@ export async function runPayouts(env: Env, limit = 25) {
   const { results } = await env.DB.prepare(
     `SELECT y.id, y.kind, y.amount_cents, u.linuxdo_id, u.username, p.name AS product
        FROM payouts y JOIN users u ON u.id = y.sharer_id JOIN products p ON p.key = y.product_key
-      WHERE y.status = 'pending' AND y.due_at <= ?
+      WHERE y.status = 'pending' AND y.due_at <= ?1
+        AND (?3 IS NULL OR y.id IN (SELECT value FROM json_each(?3)))
       ORDER BY y.due_at
-      LIMIT ?`,
+      LIMIT ?2`,
   )
-    .bind(t, limit)
+    .bind(t, limit, only ? JSON.stringify(only) : null)
     .all<PayoutJob>()
 
   const base = env.LDC_BASE || 'https://credit.linux.do'
@@ -1295,6 +1297,45 @@ admin.post('/payouts/run', async (c) => {
   return c.json(await runPayouts(c.env))
 })
 
+// 立即发放：跳过观察期，马上发。有人反馈无效（held）的不发；全站 24 小时上限照样算。
+async function sendNow(c: Context<AppEnv>, ids: string[]) {
+  const s = await getSettings(c.env.DB)
+  if (!ldcConfigured(c.env)) return fail(c, 409, 'ldc_not_configured', '还没设置 LDC 商户凭证，发不了')
+  if (!s.ldc_enabled) return fail(c, 409, 'ldc_disabled', 'LDC 奖励没开启，先在设置里打开')
+  if (ids.length === 0) return fail(c, 404, 'nothing_to_send', '没有可以立即发放的奖励')
+  const t = now()
+  await c.env.DB.prepare(
+    `UPDATE payouts SET status = 'pending', due_at = ?1, updated_at = ?1
+      WHERE id IN (SELECT value FROM json_each(?2)) AND status IN ('pending', 'failed')`,
+  )
+    .bind(t, JSON.stringify(ids))
+    .run()
+  const r = await runPayouts(c.env, ids.length, ids)
+  return c.json(r)
+}
+
+admin.post('/payouts/:id/send-now', async (c) => {
+  const row = await c.env.DB.prepare("SELECT id, status FROM payouts WHERE id = ?")
+    .bind(c.req.param('id'))
+    .first<{ id: string; status: string }>()
+  if (!row) return fail(c, 404, 'not_found', '没有这笔奖励')
+  if (row.status === 'held') return fail(c, 409, 'held', '这个码有人反馈无效，先处理反馈再发')
+  if (row.status !== 'pending' && row.status !== 'failed') return fail(c, 409, 'not_sendable', '已经发出或已取消')
+  return sendNow(c, [row.id])
+})
+
+admin.post('/users/:id/send-now', async (c) => {
+  const { results } = await c.env.DB.prepare(
+    "SELECT id FROM payouts WHERE sharer_id = ? AND status IN ('pending', 'failed') ORDER BY created_at LIMIT 100",
+  )
+    .bind(Number(c.req.param('id')))
+    .all<{ id: string }>()
+  return sendNow(
+    c,
+    results.map((r) => r.id),
+  )
+})
+
 admin.post('/payouts/:id/retry', async (c) => {
   const r = await c.env.DB.prepare(
     "UPDATE payouts SET status = 'pending', due_at = ?1, updated_at = ?1 WHERE id = ?2 AND status = 'failed'",
@@ -1320,7 +1361,13 @@ admin.get('/users', async (c) => {
     `SELECT u.id, u.linuxdo_id, u.username, u.name, u.avatar_url, u.trust_level, u.created_at, u.last_login_at,
             (SELECT COUNT(*) FROM codes c WHERE c.sharer_id = u.id AND c.status <> 'withdrawn') AS codes,
             (SELECT COUNT(*) FROM claims x WHERE x.sharer_id = u.id) AS given,
-            (SELECT COUNT(*) FROM claims x WHERE x.user_id = u.id) AS received
+            (SELECT COUNT(*) FROM claims x WHERE x.user_id = u.id) AS received,
+            (SELECT COALESCE(SUM(amount_cents), 0) FROM payouts y
+              WHERE y.sharer_id = u.id AND y.status IN ('pending', 'failed')) AS unpaid_cents,
+            (SELECT COALESCE(SUM(amount_cents), 0) FROM payouts y
+              WHERE y.sharer_id = u.id AND y.status = 'held') AS held_cents,
+            (SELECT COALESCE(SUM(amount_cents), 0) FROM payouts y
+              WHERE y.sharer_id = u.id AND y.status = 'sent') AS sent_cents
        FROM users u
       ORDER BY u.last_login_at DESC
       LIMIT 1000`,

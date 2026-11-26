@@ -44,6 +44,16 @@ import {
 
 const errMsg = (e: unknown, d: string) => (e instanceof ApiError ? e.message : d)
 
+const sentToast = (r: { sent: number; failed: number; waiting: number }) => {
+  if (r.sent && !r.failed && !r.waiting) toast(`已立即发出 ${r.sent} 笔`)
+  else
+    toast(
+      `发出 ${r.sent} 笔${r.failed ? `，失败 ${r.failed} 笔（看 LDC 奖励里的原因）` : ''}${
+        r.waiting ? `，${r.waiting} 笔超过全站 24 小时上限暂缓` : ''
+      }`,
+    )
+}
+
 export function AdminPage({ version, onChanged }: { version: number; onChanged: () => void }) {
   const [openReports, setOpenReports] = useState(0)
   const [pendingRequests, setPendingRequests] = useState(0)
@@ -87,7 +97,7 @@ export function AdminPage({ version, onChanged }: { version: number; onChanged: 
         <CodesPanel version={version} onChanged={onChanged} />
       </TabsContent>
       <TabsContent value="users">
-        <UsersPanel version={version} />
+        <UsersPanel version={version} onChanged={onChanged} />
       </TabsContent>
       <TabsContent value="ldc">
         <LdcPanel version={version} onChanged={onChanged} />
@@ -794,8 +804,10 @@ function CodesPanel({ version, onChanged }: { version: number; onChanged: () => 
 
 // ---------- 用户 ----------
 
-function UsersPanel({ version }: { version: number }) {
+function UsersPanel({ version, onChanged }: { version: number; onChanged: () => void }) {
   const [users, setUsers] = useState<AdminUser[] | null>(null)
+  const [paying, setPaying] = useState<AdminUser | null>(null)
+  const [busy, setBusy] = useState(false)
   useEffect(() => {
     api.admin
       .users()
@@ -803,11 +815,27 @@ function UsersPanel({ version }: { version: number }) {
       .catch(() => setUsers([]))
   }, [version])
 
+  const payNow = async () => {
+    if (!paying) return
+    setBusy(true)
+    try {
+      sentToast(await api.admin.sendUserNow(paying.id))
+      setPaying(null)
+      onChanged()
+    } catch (e) {
+      toast.error(errMsg(e, '没发出去'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <Card>
       <CardHeader>
         <CardTitle>已注册用户</CardTitle>
-        <CardDescription>按最近登录排序。分享 = 还在的码，送出 / 领到 = 领取次数。</CardDescription>
+        <CardDescription>
+          按最近登录排序。分享 = 还在的码，送出 / 领到 = 领取次数。「立即发放」会跳过观察期，马上把这个人待发的奖励发出去。
+        </CardDescription>
       </CardHeader>
       <CardContent>
         {users === null ? (
@@ -823,7 +851,9 @@ function UsersPanel({ version }: { version: number }) {
                 <TableHead>分享</TableHead>
                 <TableHead>送出</TableHead>
                 <TableHead>领到</TableHead>
+                <TableHead>奖励（已发 / 待发）</TableHead>
                 <TableHead>最近登录</TableHead>
+                <TableHead className="text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -840,13 +870,44 @@ function UsersPanel({ version }: { version: number }) {
                   <TableCell className="tabular-nums">{u.codes}</TableCell>
                   <TableCell className="tabular-nums">{u.given}</TableCell>
                   <TableCell className="tabular-nums">{u.received}</TableCell>
+                  <TableCell className="text-sm tabular-nums">
+                    {ldc(u.sent_cents)} / {ldc(u.unpaid_cents)}
+                    {u.held_cents ? <div className="text-xs text-muted-foreground">另有 {ldc(u.held_cents)} 被扣下</div> : null}
+                  </TableCell>
                   <TableCell className="text-xs text-muted-foreground">{timeAgo(u.last_login_at)}</TableCell>
+                  <TableCell className="text-right">
+                    {u.unpaid_cents > 0 ? (
+                      <Button size="sm" variant="outline" onClick={() => setPaying(u)}>
+                        立即发放
+                      </Button>
+                    ) : null}
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>
           </Table>
         )}
       </CardContent>
+
+      <Dialog open={!!paying} onOpenChange={(o) => !o && setPaying(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>立即给 {paying?.username} 发放奖励？</DialogTitle>
+            <DialogDescription>
+              会跳过观察期，马上从你的 LDC 商户账户发出 {ldc(paying?.unpaid_cents)} LDC（他所有待发和发送失败的奖励）。
+              有人反馈无效、被扣下的不会发；全站 24 小时上限照样算。发出后收不回。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPaying(null)}>
+              取消
+            </Button>
+            <Button onClick={payNow} disabled={busy}>
+              {busy ? '发放中…' : `立即发放 ${ldc(paying?.unpaid_cents)} LDC`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   )
 }
@@ -934,6 +995,15 @@ function LdcPanel({ version, onChanged }: { version: number; onChanged: () => vo
       loadPayouts()
     } catch (e) {
       toast.error(errMsg(e, '发放失败'))
+    }
+  }
+
+  const payNow = async (p: AdminPayout) => {
+    try {
+      sentToast(await api.admin.sendPayoutNow(p.id))
+      loadPayouts()
+    } catch (e) {
+      toast.error(errMsg(e, '没发出去'))
     }
   }
 
@@ -1101,6 +1171,11 @@ function LdcPanel({ version, onChanged }: { version: number; onChanged: () => vo
                       {p.trade_no ? <div className="mt-1 text-xs text-muted-foreground">LDC 单号 {p.trade_no}</div> : null}
                     </TableCell>
                     <TableCell className="text-right whitespace-nowrap">
+                      {p.status === 'pending' || p.status === 'failed' ? (
+                        <Button size="sm" variant="outline" onClick={() => payNow(p)}>
+                          立即发
+                        </Button>
+                      ) : null}
                       {p.status === 'failed' ? (
                         <Button size="sm" variant="ghost" onClick={() => act(p, 'retry')}>
                           重试
