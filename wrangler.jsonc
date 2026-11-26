@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "invite-exchange",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "triggers": { "crons": ["0 19 * * *"] },
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "invite-exchange",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    // LinuxDO 信任等级下限：低于这个等级的账号只能看，不能领码（0 = 不限制）
+    "MIN_TRUST_LEVEL": "1",
+    // 每人 24 小时内最多领几个码（不同产品各算一个）
+    "MAX_CLAIMS_PER_DAY": "5",
+    // 每人 24 小时内最多分享几个码
+    "MAX_SHARES_PER_DAY": "30",
+    "LINUXDO_BASE": "https://connect.linux.do"
+  }
+  // 机密不要写在这里，用 wrangler secret put：
+  //   LINUXDO_CLIENT_ID, LINUXDO_CLIENT_SECRET
+}

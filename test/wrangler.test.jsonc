@@ -1,0 +1,18 @@
+// 只用于本地接口测试：不带前端静态资源，开启 dev-login
+{
+  "name": "invite-exchange-test",
+  "main": "../worker/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "invite-exchange", "database_id": "local-test", "migrations_dir": "../migrations" }
+  ],
+  "vars": {
+    "MIN_TRUST_LEVEL": "1",
+    "MAX_CLAIMS_PER_DAY": "5",
+    "MAX_SHARES_PER_DAY": "30",
+    "DEV_LOGIN": "1",
+    "LINUXDO_CLIENT_ID": "test-client",
+    "LINUXDO_CLIENT_SECRET": "test-secret"
+  }
+}

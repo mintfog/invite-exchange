@@ -1,0 +1,5 @@
+# 复制成 .dev.vars 用于本地开发（不要提交到仓库）
+LINUXDO_CLIENT_ID=你的_client_id
+LINUXDO_CLIENT_SECRET=你的_client_secret
+# 本地开发时打开：访问 /api/auth/dev-login?u=alice 直接登录，不用连 LinuxDO
+DEV_LOGIN=1
