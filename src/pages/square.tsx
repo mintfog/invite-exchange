@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Coins, Gift, Heart, Search } from 'lucide-react'
+import { Coins, Gift, Heart, Repeat, Search } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -50,6 +50,8 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
   const [thanked, setThanked] = useState(false)
   const [reporting, setReporting] = useState<NewClaim | null>(null)
   const [requesting, setRequesting] = useState(false)
+  const [depositFor, setDepositFor] = useState<Product | null>(null)
+  const [paying, setPaying] = useState(false)
 
   useEffect(() => {
     api
@@ -76,10 +78,32 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
       setClaim(r.claim)
       onChanged()
     } catch (e) {
+      if (e instanceof ApiError && e.code === 'deposit_required') {
+        setDepositFor(p)
+        onChanged()
+        return
+      }
       toast.error(e instanceof ApiError ? e.message : '领取失败')
       if (e instanceof ApiError && e.code === 'empty') onChanged()
     } finally {
       setClaiming(null)
+    }
+  }
+
+  // 跳到 LINUX DO Credit 付押金，付完会回到广场
+  const doPay = async () => {
+    if (!depositFor) return
+    setPaying(true)
+    try {
+      const r = await api.payDeposit(depositFor.key)
+      window.location.href = r.url
+    } catch (e) {
+      setPaying(false)
+      if (e instanceof ApiError && e.code === 'has_deposit') {
+        setDepositFor(null)
+        onChanged()
+      }
+      toast.error(e instanceof ApiError ? e.message : '没打开付款页面')
     }
   }
 
@@ -195,6 +219,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
                     ) : null}
                   </div>
                   <RewardLine product={p} />
+                  <RelayLine product={p} />
                 </CardContent>
                 <CardFooter>
                   <ClaimButton
@@ -203,6 +228,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
                     lowTrust={lowTrust}
                     loading={claiming === p.key}
                     onClaim={() => doClaim(p)}
+                    onDeposit={() => setDepositFor(p)}
                   />
                 </CardFooter>
               </Card>
@@ -227,6 +253,28 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
             <CopyButton value={claim?.code ?? ''} />
           </div>
           {claim?.note ? <p className="text-sm text-muted-foreground">分享者留言：{claim.note}</p> : null}
+          {claim?.deposit_cents ? (
+            <Alert>
+              <Repeat />
+              <AlertTitle>记得接力，押金才能退回</AlertTitle>
+              <AlertDescription>
+                <p>
+                  注册好以后，把你自己的 {claim.product} 邀请码放进分享。它被别人领走、过了观察期没人反馈无效，
+                  {ldc(claim.deposit_cents)} LDC 押金会原路退回。
+                </p>
+                <Button
+                  variant="link"
+                  className="h-auto p-0"
+                  onClick={() => {
+                    setClaim(null)
+                    onGoShare()
+                  }}
+                >
+                  去放回我的码
+                </Button>
+              </AlertDescription>
+            </Alert>
+          ) : null}
           <DialogFooter>
             <Button
               variant="ghost"
@@ -252,6 +300,33 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
         onClose={() => setReporting(null)}
         onDone={onChanged}
       />
+      <Dialog open={!!depositFor} onOpenChange={(o) => !o && !paying && setDepositFor(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>领 {depositFor?.name} 要先付押金</DialogTitle>
+            <DialogDescription>
+              这是接力产品：领码前通过 LINUX DO Credit 付 {ldc(depositFor?.deposit_cents)} LDC 押金。
+            </DialogDescription>
+          </DialogHeader>
+          <ol className="flex list-decimal flex-col gap-1 pl-5 text-sm text-muted-foreground">
+            <li>付好押金后回到这里，点「领一个」。</li>
+            <li>用领到的码注册后，把你自己的 {depositFor?.name} 邀请码放进分享。</li>
+            <li>你的码被别人领走、过了观察期没人反馈无效，押金原路退回。</li>
+          </ol>
+          <p className="text-sm text-muted-foreground">
+            没领到码，或领到的码被确认无效，可以在「我的 → 押金」里自己退回。
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDepositFor(null)} disabled={paying}>
+              先不领
+            </Button>
+            <Button onClick={doPay} disabled={paying}>
+              {paying ? '正在打开付款页…' : `去付 ${ldc(depositFor?.deposit_cents)} LDC`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <RequestProductDialog open={requesting} initialName={query.trim()} onClose={() => setRequesting(false)} />
     </div>
   )
@@ -266,6 +341,18 @@ function RewardLine({ product: p }: { product: Product }) {
     <span className="flex items-center gap-1 text-foreground">
       <Coins className="size-4" />
       分享奖励 LDC：{parts.join('，')}
+    </span>
+  )
+}
+
+function RelayLine({ product: p }: { product: Product }) {
+  if (!p.deposit_cents) return null
+  return (
+    <span className="flex items-center gap-1 text-foreground">
+      <Repeat className="size-4" />
+      {p.has_deposit
+        ? `接力产品：押金 ${ldc(p.deposit_cents)} LDC 已付，可以领了`
+        : `接力产品：领前付 ${ldc(p.deposit_cents)} LDC 押金，放回你的码被领走后退回`}
     </span>
   )
 }
@@ -287,12 +374,14 @@ function ClaimButton({
   lowTrust,
   loading,
   onClaim,
+  onDeposit,
 }: {
   product: Product
   user: User | null
   lowTrust: boolean
   loading: boolean
   onClaim: () => void
+  onDeposit: () => void
 }) {
   if (!user) {
     return (
@@ -313,6 +402,13 @@ function ClaimButton({
     return (
       <Button variant="secondary" className="w-full" disabled>
         {product.available > 0 ? '只剩你自己的码' : '暂无可领'}
+      </Button>
+    )
+  }
+  if (product.deposit_cents && !product.has_deposit) {
+    return (
+      <Button className="w-full" onClick={onDeposit} disabled={lowTrust}>
+        付 {ldc(product.deposit_cents)} LDC 押金后领取
       </Button>
     )
   }

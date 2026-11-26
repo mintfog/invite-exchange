@@ -24,6 +24,7 @@ import { Textarea } from '@/components/ui/textarea'
 
 import {
   api,
+  DEPOSIT_STATUS,
   ApiError,
   ldc,
   parseLdc,
@@ -32,6 +33,8 @@ import {
   timeAgo,
   timeUntil,
   type AdminCode,
+  type AdminDeposit,
+  type DepositStatus,
   type AdminPayout,
   type AdminProduct,
   type AdminProductRequest,
@@ -86,6 +89,7 @@ export function AdminPage({ version, onChanged }: { version: number; onChanged: 
         <TabsTrigger value="codes">邀请码</TabsTrigger>
         <TabsTrigger value="users">用户</TabsTrigger>
         <TabsTrigger value="ldc">LDC 奖励</TabsTrigger>
+        <TabsTrigger value="relay">接力押金</TabsTrigger>
       </TabsList>
       <TabsContent value="reports">
         <ReportsPanel version={version} onChanged={onChanged} />
@@ -101,6 +105,9 @@ export function AdminPage({ version, onChanged }: { version: number; onChanged: 
       </TabsContent>
       <TabsContent value="ldc">
         <LdcPanel version={version} onChanged={onChanged} />
+      </TabsContent>
+      <TabsContent value="relay">
+        <RelayPanel version={version} onChanged={onChanged} />
       </TabsContent>
     </Tabs>
   )
@@ -254,6 +261,7 @@ type ProductForm = {
   description: string
   share_reward: string
   claim_reward: string
+  relay: boolean
   locked: boolean
   /** 通过某条产品申请时才有 */
   request_id?: string
@@ -270,6 +278,7 @@ const EMPTY_FORM: ProductForm = {
   description: '',
   share_reward: '',
   claim_reward: '',
+  relay: false,
   locked: false,
 }
 
@@ -331,6 +340,7 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
       description: p.description ?? '',
       share_reward: p.share_reward_cents === null ? '' : ldc(p.share_reward_cents),
       claim_reward: p.claim_reward_cents === null ? '' : ldc(p.claim_reward_cents),
+      relay: !!p.relay_required,
       locked: p.codes > 0,
     })
 
@@ -352,6 +362,7 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
       description: form.description.trim() || null,
       share_reward_cents: share,
       claim_reward_cents: claim,
+      relay_required: form.relay,
     }
     setBusy(true)
     try {
@@ -524,6 +535,7 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
                       <div className="flex items-center gap-2 font-medium">
                         {p.name}
                         {p.active ? null : <Badge variant="secondary">已下架</Badge>}
+                        {p.relay_required ? <Badge variant="outline">接力</Badge> : null}
                       </div>
                       <span className="text-xs text-muted-foreground">{p.sharers} 位分享者</span>
                     </TableCell>
@@ -662,6 +674,20 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
                       onChange={(e) => set({ claim_reward: e.target.value })}
                     />
                   </div>
+                </div>
+                <div className="flex flex-col gap-2">
+                  <Label>接力</Label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button type="button" variant={form.relay ? 'outline' : 'default'} onClick={() => set({ relay: false })}>
+                      不需要
+                    </Button>
+                    <Button type="button" variant={form.relay ? 'default' : 'outline'} onClick={() => set({ relay: true })}>
+                      需要接力
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    需要接力时，领码前先付押金；领到的人放回自己的码、被别人领走后押金退回。押金金额和总开关在「接力押金」里设。
+                  </p>
                 </div>
                 {form.request_id ? (
                   <div className="flex flex-col gap-2">
@@ -1194,6 +1220,266 @@ function LdcPanel({ version, onChanged }: { version: number; onChanged: () => vo
           )}
         </CardContent>
       </Card>
+    </div>
+  )
+}
+
+// ---------- 接力押金 ----------
+
+function RelayPanel({ version, onChanged }: { version: number; onChanged: () => void }) {
+  const [settings, setSettings] = useState<Settings | null>(null)
+  const [configured, setConfigured] = useState<boolean | null>(null)
+  const [amount, setAmount] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [status, setStatus] = useState<'all' | DepositStatus>('all')
+  const [deposits, setDeposits] = useState<AdminDeposit[] | null>(null)
+  const [confirm, setConfirm] = useState<{ d: AdminDeposit; kind: 'refund' | 'forfeit' } | null>(null)
+
+  useEffect(() => {
+    api.admin
+      .settings()
+      .then((r) => {
+        setSettings(r.settings)
+        setConfigured(r.ldc_configured)
+        setAmount(ldc(r.settings.relay_deposit_cents))
+      })
+      .catch(() => setConfigured(false))
+  }, [version])
+
+  const load = useCallback(() => {
+    api.admin
+      .deposits(status)
+      .then((r) => setDeposits(r.deposits))
+      .catch(() => setDeposits([]))
+  }, [status])
+
+  useEffect(() => {
+    setDeposits(null)
+    load()
+  }, [load, version])
+
+  const save = async (enabled?: boolean) => {
+    const cents = parseLdc(amount)
+    if (!cents) return toast.error('押金要是大于 0 的数字，最多两位小数')
+    setBusy(true)
+    try {
+      const r = await api.admin.saveSettings({
+        relay_enabled: enabled ?? settings?.relay_enabled ?? false,
+        relay_deposit_cents: cents,
+      })
+      setSettings(r.settings)
+      setAmount(ldc(r.settings.relay_deposit_cents))
+      toast(enabled === undefined ? '已保存' : enabled ? '接力已开启' : '接力已关闭')
+      onChanged()
+    } catch (e) {
+      toast.error(errMsg(e, '没保存成功'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const run = async () => {
+    try {
+      const r = await api.admin.runRefunds()
+      toast(`退回 ${r.refunded} 笔，失败 ${r.failed} 笔`)
+      load()
+    } catch (e) {
+      toast.error(errMsg(e, '没退成'))
+    }
+  }
+
+  const doConfirm = async () => {
+    if (!confirm) return
+    const { d, kind } = confirm
+    try {
+      if (kind === 'refund') await api.admin.refundDeposit(d.id)
+      else await api.admin.forfeitDeposit(d.id)
+      toast(kind === 'refund' ? `已退回 ${d.username} 的押金` : `已没收 ${d.username} 的押金`)
+      setConfirm(null)
+      load()
+    } catch (e) {
+      toast.error(errMsg(e, '操作失败'))
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+      {configured === false ? (
+        <Alert>
+          <AlertTitle>还没接上 LINUX DO Credit</AlertTitle>
+          <AlertDescription>
+            押金通过 LINUX DO Credit 收款和退款，要先设置商户凭证（和 LDC 奖励用的是同一套），并在商户应用里把回调地址设成本站的
+            /api/ldc/notify。
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>接力设置</CardTitle>
+          <CardDescription>
+            开启后，标了「需要接力」的产品领码前要先付押金。领到的人把自己的同产品邀请码放回分享，被别人领走、过了观察期（和 LDC
+            奖励同一个观察期）没人反馈无效，押金自动原路退回。
+          </CardDescription>
+          <CardAction>
+            {settings ? (
+              <Button
+                size="sm"
+                variant={settings.relay_enabled ? 'outline' : 'default'}
+                disabled={busy}
+                onClick={() => save(!settings.relay_enabled)}
+              >
+                {settings.relay_enabled ? '关闭接力' : '开启接力'}
+              </Button>
+            ) : null}
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          {!settings ? (
+            <Skeleton className="h-20" />
+          ) : (
+            <form
+              className="flex flex-col gap-4"
+              onSubmit={(e) => {
+                e.preventDefault()
+                save()
+              }}
+            >
+              <div className="flex items-center gap-2 text-sm">
+                现在：
+                <Badge variant={settings.relay_enabled ? 'default' : 'secondary'}>
+                  {settings.relay_enabled ? '已开启' : '已关闭'}
+                </Badge>
+              </div>
+              <div className="max-w-xs">
+                <Field
+                  id="r-amount"
+                  label="押金（LDC）"
+                  hint="每领一个接力产品收一次"
+                  value={amount}
+                  onChange={setAmount}
+                />
+              </div>
+              <div>
+                <Button type="submit" disabled={busy}>
+                  保存
+                </Button>
+              </div>
+            </form>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>押金记录</CardTitle>
+          <CardDescription>系统每 10 分钟自动退一次到期的押金。没收只在确认有人恶意不接力时用。</CardDescription>
+          <CardAction>
+            <Button size="sm" variant="outline" onClick={run}>
+              立即退到期的
+            </Button>
+          </CardAction>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4">
+          <Filter
+            value={status}
+            onChange={setStatus}
+            options={[
+              ['all', '全部'],
+              ['paid', '已付未用'],
+              ['used', '等放回'],
+              ['refund_due', '待退回'],
+              ['refund_failed', '退回失败'],
+              ['refunded', '已退回'],
+            ]}
+          />
+          {deposits === null ? (
+            <Skeleton className="h-32" />
+          ) : deposits.length === 0 ? (
+            <Empty text="没有记录。" />
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>用户</TableHead>
+                  <TableHead>产品</TableHead>
+                  <TableHead>押金</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead className="text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {deposits.map((d) => (
+                  <TableRow key={d.id}>
+                    <TableCell>
+                      <UserCell name={d.username} avatar={d.avatar_url} />
+                    </TableCell>
+                    <TableCell>
+                      <div className="font-medium">{d.product}</div>
+                      <div className="text-xs text-muted-foreground">付于 {timeAgo(d.paid_at ?? d.created_at)}</div>
+                    </TableCell>
+                    <TableCell className="tabular-nums">{ldc(d.amount_cents)} LDC</TableCell>
+                    <TableCell className="max-w-56 whitespace-normal">
+                      <Badge
+                        variant={
+                          d.status === 'refund_failed' || d.status === 'forfeited'
+                            ? 'destructive'
+                            : d.status === 'refunded'
+                              ? 'secondary'
+                              : 'outline'
+                        }
+                      >
+                        {d.status === 'used' && d.relayed
+                          ? '已放回码，等人领走'
+                          : d.status === 'refund_due' && d.refund_due_at
+                            ? `${timeUntil(d.refund_due_at)}退回`
+                            : DEPOSIT_STATUS[d.status]}
+                      </Badge>
+                      {d.error ? <div className="mt-1 text-xs text-muted-foreground">{d.error}</div> : null}
+                      {d.trade_no ? <div className="mt-1 text-xs text-muted-foreground">LDC 单号 {d.trade_no}</div> : null}
+                    </TableCell>
+                    <TableCell className="text-right whitespace-nowrap">
+                      {['paid', 'used', 'refund_due', 'refund_failed'].includes(d.status) ? (
+                        <Button size="sm" variant="outline" onClick={() => setConfirm({ d, kind: 'refund' })}>
+                          退回
+                        </Button>
+                      ) : null}
+                      {d.status === 'used' || d.status === 'refund_failed' ? (
+                        <Button size="sm" variant="ghost" onClick={() => setConfirm({ d, kind: 'forfeit' })}>
+                          没收
+                        </Button>
+                      ) : null}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
+      <Dialog open={!!confirm} onOpenChange={(o) => !o && setConfirm(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {confirm?.kind === 'refund' ? '退回' : '没收'} {confirm?.d.username} 的押金？
+            </DialogTitle>
+            <DialogDescription>
+              {confirm?.kind === 'refund'
+                ? `马上通过 LINUX DO Credit 把 ${ldc(confirm?.d.amount_cents)} LDC 原路退给 ${confirm?.d.username}，退了收不回来。`
+                : `这笔 ${ldc(confirm?.d.amount_cents)} LDC 押金不再退回，用户在「我的 → 押金」里会看到已没收。`}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirm(null)}>
+              取消
+            </Button>
+            <Button variant={confirm?.kind === 'forfeit' ? 'destructive' : 'default'} onClick={doConfirm}>
+              {confirm?.kind === 'refund' ? '退回' : '没收'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

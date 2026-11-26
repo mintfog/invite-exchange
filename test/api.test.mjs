@@ -2,6 +2,7 @@
 // 先跑：npx wrangler dev -c test/wrangler.test.jsonc --port 8799 --var LINUXDO_BASE:http://127.0.0.1:8800
 // 脚本会自己在 8800 端口起一个假的 LinuxDO OAuth 服务。
 import http from 'node:http'
+import { createHash } from 'node:crypto'
 import assert from 'node:assert/strict'
 
 const BASE = process.env.BASE ?? 'http://127.0.0.1:8799'
@@ -21,6 +22,18 @@ const tokens = {}
 // 假 LINUX DO Credit：只记录请求，不会发出真的 LDC
 const ldcCalls = []
 const ldcSeen = new Set()
+const refundCalls = []
+// 和 worker 里一样的易支付签名
+const epaySign = (params, secret) =>
+  createHash('md5')
+    .update(
+      Object.keys(params)
+        .filter((k) => params[k] !== '' && k !== 'sign' && k !== 'sign_type')
+        .sort()
+        .map((k) => `${k}=${params[k]}`)
+        .join('&') + secret,
+    )
+    .digest('hex')
 const mock = http.createServer((req, res) => {
   let body = ''
   req.on('data', (d) => (body += d))
@@ -36,6 +49,14 @@ const mock = http.createServer((req, res) => {
       ldcSeen.add(b.out_trade_no)
       ldcCalls.push(b)
       return send(200, { error_msg: '', data: { trade_no: String(9000 + ldcCalls.length), out_trade_no: b.out_trade_no } })
+    }
+    if (req.url === '/epay/api.php' && req.method === 'POST') {
+      const p = Object.fromEntries(new URLSearchParams(body))
+      const send = (obj) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(obj))
+      if (p.act !== 'refund' || p.pid !== 'ldc-test' || p.key !== 'ldc-secret') return send({ code: -1, msg: '凭证不对' })
+      if (refundCalls.some((r) => r.trade_no === p.trade_no)) return send({ code: -1, msg: '已经退过' })
+      refundCalls.push(p)
+      return send({ code: 1, msg: '退款成功' })
     }
     if (req.url === '/oauth2/token' && req.method === 'POST') {
       const p = new URLSearchParams(body)
@@ -760,6 +781,131 @@ try {
     assert.ok(!(await pr.json('/api/products')).data.products.some((p) => p.name === 'Req B'))
     assert.equal((await pr2.json('/api/product-requests', 'POST', { name: 'Req B' })).status, 200)
     ok('管理员拒绝：不建产品，申请人看到理由；拒绝后别人可以再申请')
+  }
+
+  console.log('接力押金（假 LDC 服务，不会真的扣款退款）')
+  {
+    await boss.json('/api/admin/settings', 'PUT', { relay_enabled: true, relay_deposit_cents: 300, hold_hours: 0 })
+    assert.equal((await boss.json('/api/admin/products', 'POST', { name: 'Relay', mode: 'single', relay_required: true })).status, 200)
+    const s0 = await new Client().devLogin('relay0')
+    const r1 = await new Client().devLogin('relay1')
+    const r2 = await new Client().devLogin('relay2')
+    const r3 = await new Client().devLogin('relay3')
+    const r4 = await new Client().devLogin('relay4')
+    const key = (await r1.json('/api/products')).data.products.find((p) => p.name === 'Relay').key
+    assert.equal((await s0.json('/api/codes', 'POST', { product_key: key, codes: 'RELAY-0' })).status, 200)
+    const prod = (await r1.json('/api/products')).data.products.find((p) => p.key === key)
+    assert.equal(prod.deposit_cents, 300)
+    assert.equal(prod.has_deposit, 0)
+    const noDep = await r1.json('/api/claim', 'POST', { product_key: key })
+    assert.equal(noDep.status, 402)
+    assert.equal(noDep.data.error, 'deposit_required')
+    assert.equal((await r1.json('/api/products/quick/deposit', 'POST')).status, 409)
+    ok('要接力的产品：没付押金不能领，不要接力的产品不收押金')
+
+    // 付押金：拿到 LDC 付款链接，模拟 LDC 回调
+    const pay = async (cl) => {
+      const r = await cl.json(`/api/products/${key}/deposit`, 'POST')
+      assert.equal(r.status, 200, JSON.stringify(r.data))
+      const u = new URL(r.data.url)
+      assert.equal(u.pathname, '/epay/pay/submit.php')
+      const q = Object.fromEntries(u.searchParams)
+      assert.equal(q.money, '3.00')
+      assert.equal(q.pid, 'ldc-test')
+      assert.equal(q.sign, epaySign(q, 'ldc-secret'))
+      return q
+    }
+    const notify = (q, extra = {}) => {
+      const n = { pid: q.pid, trade_no: `T-${q.out_trade_no}`, out_trade_no: q.out_trade_no, type: 'epay', name: q.name, money: q.money, trade_status: 'TRADE_SUCCESS', ...extra }
+      n.sign_type = 'MD5'
+      n.sign = extra.sign ?? epaySign(n, 'ldc-secret')
+      return fetch(`${BASE}/api/ldc/notify?${new URLSearchParams(n)}`)
+    }
+    const q1 = await pay(r1)
+    assert.equal((await notify(q1, { sign: 'bad' })).status, 400)
+    assert.equal((await notify(q1, { money: '0.01' })).status, 400)
+    assert.equal((await r1.json('/api/claim', 'POST', { product_key: key })).status, 402)
+    const okN = await notify(q1)
+    assert.equal(okN.status, 200)
+    assert.equal(await okN.text(), 'success')
+    assert.equal(await (await notify(q1)).text(), 'success')
+    assert.equal((await r1.json('/api/my/deposits')).data.deposits.length, 1)
+    assert.equal((await r1.json(`/api/products/${key}/deposit`, 'POST')).data.error, 'has_deposit')
+    ok('付押金：签名正确、金额对得上才记为已付，重复回调不重复记')
+
+    const c1 = await r1.json('/api/claim', 'POST', { product_key: key })
+    assert.equal(c1.status, 200, JSON.stringify(c1.data))
+    assert.equal(c1.data.claim.deposit_cents, 300)
+    let mine = (await r1.json('/api/my/claimed')).data.claims.find((x) => x.product_key === key || x.code === 'RELAY-0')
+    assert.equal(mine.deposit_status, 'used')
+    assert.equal(mine.relayed, 0)
+    const sh1 = await r1.json('/api/codes', 'POST', { product_key: key, codes: 'RELAY-1' })
+    assert.equal(sh1.data.relayed, 1)
+    ok('付了押金就能领；领到后放回自己的码，记为接力')
+
+    const before = refundCalls.length
+    await boss.json('/api/admin/deposits/run', 'POST')
+    assert.equal(refundCalls.length, before)
+    await notify(await pay(r2))
+    const c2 = await r2.json('/api/claim', 'POST', { product_key: key })
+    assert.equal(c2.data.claim.code, 'RELAY-1')
+    assert.equal((await r1.json('/api/my/deposits')).data.deposits[0].status, 'refund_due')
+    const run = await boss.json('/api/admin/deposits/run', 'POST')
+    assert.equal(run.data.refunded, 1)
+    assert.equal(refundCalls.length, before + 1)
+    assert.equal(refundCalls.at(-1).trade_no, `T-${q1.out_trade_no}`)
+    assert.equal(refundCalls.at(-1).money, '3.00')
+    assert.equal((await r1.json('/api/my/deposits')).data.deposits[0].status, 'refunded')
+    assert.equal((await boss.json('/api/admin/deposits/run', 'POST')).data.refunded, 0)
+    ok('放回的码被别人领走、过了观察期：押金原路退回，只退一次')
+
+    // 没用上的押金自己退；撤回接力码后押金不退
+    const sh2 = await r2.json('/api/codes', 'POST', { product_key: key, codes: 'RELAY-2' })
+    assert.equal(sh2.data.relayed, 1)
+    await notify(await pay(r3))
+    const d3 = (await r3.json('/api/my/deposits')).data.deposits[0]
+    assert.equal((await r2.json(`/api/deposits/${d3.id}/refund`, 'POST')).status, 404)
+    assert.equal((await r3.json(`/api/deposits/${d3.id}/refund`, 'POST')).status, 200)
+    assert.equal((await r3.json('/api/my/deposits')).data.deposits[0].status, 'refunded')
+    const d2 = (await r2.json('/api/my/deposits')).data.deposits[0]
+    assert.equal((await r2.json(`/api/deposits/${d2.id}/refund`, 'POST')).data.error, 'not_refundable')
+    const code2 = (await r2.json('/api/my/shared')).data.codes.find((x) => x.code === 'RELAY-2')
+    assert.equal((await r2.json(`/api/codes/${code2.id}`, 'DELETE')).status, 200)
+    assert.equal((await r2.json('/api/my/deposits')).data.deposits[0].relayed, 0)
+    ok('没用上的押金可以自己退；撤回接力码后要重新放回才能退')
+
+    // 接力的码被确认无效：领的人押金回到已付，接力的人要重新放回
+    assert.equal((await r2.json('/api/codes', 'POST', { product_key: key, codes: 'RELAY-3' })).data.relayed, 1)
+    await notify(await pay(r4))
+    const c4 = await r4.json('/api/claim', 'POST', { product_key: key })
+    assert.equal(c4.data.claim.code, 'RELAY-3')
+    assert.equal((await r2.json('/api/my/deposits')).data.deposits[0].status, 'refund_due')
+    assert.equal((await r4.json(`/api/claims/${c4.data.claim.id}/report`, 'POST', { reason: '不能用' })).status, 200)
+    const beforeR = refundCalls.length
+    await boss.json('/api/admin/deposits/run', 'POST')
+    assert.equal(refundCalls.length, beforeR)
+    const rep = (await boss.json('/api/admin/reports')).data.reports.find((x) => x.claim_id === c4.data.claim.id || x.code === 'RELAY-3')
+    assert.equal((await boss.json(`/api/admin/reports/${rep.id}/resolve`, 'POST', { action: 'confirm' })).status, 200)
+    const dep2 = (await r2.json('/api/my/deposits')).data.deposits[0]
+    assert.equal(dep2.status, 'used')
+    assert.equal(dep2.relayed, 0)
+    assert.equal((await r4.json('/api/my/deposits')).data.deposits[0].status, 'paid')
+    ok('有人反馈接力码无效、管理员确认后：押金不退，接力的人要重新放回；领到无效码的人押金回到已付')
+
+    const adm = (await boss.json('/api/admin/deposits')).data.deposits
+    assert.ok(adm.length >= 4)
+    assert.equal((await alice.json('/api/admin/deposits')).status, 403)
+    assert.equal((await boss.json(`/api/admin/deposits/${dep2.id}/forfeit`, 'POST')).status, 200)
+    assert.equal((await r2.json('/api/my/deposits')).data.deposits[0].status, 'forfeited')
+    const d4 = (await r4.json('/api/my/deposits')).data.deposits[0]
+    assert.equal((await boss.json(`/api/admin/deposits/${d4.id}/refund`, 'POST')).status, 200)
+    assert.equal((await r4.json('/api/my/deposits')).data.deposits[0].status, 'refunded')
+    ok('管理员能看所有押金、手动退回或没收')
+
+    await boss.json('/api/admin/settings', 'PUT', { relay_enabled: false, hold_hours: 24 })
+    const off = (await r1.json('/api/products')).data.products.find((p) => p.key === key)
+    assert.equal(off.deposit_cents, null)
+    ok('关掉接力后不再收押金')
   }
 
   console.log(`\n全部通过：${passed} 项`)

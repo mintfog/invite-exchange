@@ -29,6 +29,10 @@ export type Product = {
   mine_codes: number
   i_claimed: number
   last_shared_at: number | null
+  /** 要接力的产品：领之前要付的押金（分）；不需要是 null */
+  deposit_cents: number | null
+  /** 我已经付好、还没用的押金 */
+  has_deposit: number
 }
 
 export type Totals = {
@@ -98,6 +102,55 @@ export type Claim = {
   report_status: 'open' | 'confirmed' | 'dismissed' | null
   sharer_username: string
   sharer_avatar: string | null
+  deposit_id: string | null
+  deposit_status: DepositStatus | null
+  deposit_cents: number | null
+  relayed: number | null
+  refund_due_at: number | null
+}
+
+export type DepositStatus =
+  | 'pending'
+  | 'paid'
+  | 'used'
+  | 'refund_due'
+  | 'refunding'
+  | 'refunded'
+  | 'refund_failed'
+  | 'forfeited'
+
+export const DEPOSIT_STATUS: Record<DepositStatus, string> = {
+  pending: '待付款',
+  paid: '已付，还没用',
+  used: '等你放回码',
+  refund_due: '码已被领走，待退回',
+  refunding: '退回中',
+  refunded: '已退回',
+  refund_failed: '退回失败',
+  forfeited: '已没收',
+}
+
+export type Deposit = {
+  id: string
+  product_key: string
+  product: string
+  amount_cents: number
+  status: DepositStatus
+  claim_id: string | null
+  relayed: number
+  refund_due_at: number | null
+  error: string | null
+  created_at: number
+  paid_at: number | null
+  refunded_at: number | null
+}
+
+export type AdminDeposit = Omit<Deposit, 'product_key'> & {
+  trade_no: string | null
+  attempts: number
+  username: string
+  avatar_url: string | null
+  relay_claims: number
 }
 
 export type NewClaim = {
@@ -108,6 +161,7 @@ export type NewClaim = {
   product: string
   mode: Mode
   sharer_username: string
+  deposit_cents: number | null
 }
 
 // ----- 管理员 -----
@@ -124,6 +178,7 @@ export type AdminProduct = {
   created_at: number
   share_reward_cents: number | null
   claim_reward_cents: number | null
+  relay_required: number
   codes: number
   available: number
   claimed: number
@@ -139,6 +194,7 @@ export type ProductInput = {
   description?: string | null
   share_reward_cents?: number | null
   claim_reward_cents?: number | null
+  relay_required?: boolean
   active?: boolean
 }
 
@@ -191,6 +247,8 @@ export type Settings = {
   claim_reward_cents: number
   daily_cap_cents: number
   hold_hours: number
+  relay_enabled: boolean
+  relay_deposit_cents: number
 }
 
 export type PayoutStats = {
@@ -284,7 +342,7 @@ export const api = {
   logout: () => post<{ ok: true }>('/auth/logout'),
   products: () => request<{ products: Product[]; totals: Totals }>('/products'),
   share: (body: { product_key: string; codes: string; note: string; uses?: number }) =>
-    post<{ added: number; duplicates: number; product_key: string }>('/codes', body),
+    post<{ added: number; duplicates: number; product_key: string; relayed: number }>('/codes', body),
   withdraw: (id: string) => post<{ ok: true }>(`/codes/${id}`, undefined, 'DELETE'),
   setRemaining: (id: string, remaining: number) =>
     post<{ ok: true; remaining: number }>(`/codes/${id}`, { remaining }, 'PATCH'),
@@ -294,6 +352,10 @@ export const api = {
   myShared: () =>
     request<{ codes: SharedCode[]; claimers: Claimer[]; summary: SharedSummary; payouts: MyPayout[] }>('/my/shared'),
   myClaimed: () => request<{ claims: Claim[] }>('/my/claimed'),
+  payDeposit: (product_key: string) =>
+    post<{ url: string; id: string; amount_cents: number }>(`/products/${encodeURIComponent(product_key)}/deposit`),
+  myDeposits: () => request<{ deposits: Deposit[] }>('/my/deposits'),
+  refundDeposit: (id: string) => post<{ ok: true }>(`/deposits/${id}/refund`),
   requestProduct: (b: NewProductRequest) => post<{ id: string }>('/product-requests', b),
   myRequests: () => request<{ requests: ProductRequest[] }>('/my/product-requests'),
   cancelRequest: (id: string) => post<{ ok: true }>(`/product-requests/${id}`, undefined, 'DELETE'),
@@ -327,6 +389,10 @@ export const api = {
     cancelPayout: (id: string) => post<{ ok: true }>(`/admin/payouts/${id}/cancel`),
     sendPayoutNow: (id: string) => post<RunResult>(`/admin/payouts/${id}/send-now`),
     sendUserNow: (userId: number) => post<RunResult>(`/admin/users/${userId}/send-now`),
+    deposits: (status = 'all') => request<{ deposits: AdminDeposit[] }>(`/admin/deposits?status=${status}`),
+    runRefunds: () => post<{ refunded: number; failed: number }>('/admin/deposits/run'),
+    refundDeposit: (id: string) => post<{ ok: true }>(`/admin/deposits/${id}/refund`),
+    forfeitDeposit: (id: string) => post<{ ok: true }>(`/admin/deposits/${id}/forfeit`),
   },
 }
 

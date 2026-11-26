@@ -27,6 +27,7 @@ import { RequestProductDialog } from '@/components/request-product-dialog'
 import {
   api,
   ApiError,
+  DEPOSIT_STATUS,
   ldc,
   loginUrl,
   PAYOUT_STATUS,
@@ -35,6 +36,7 @@ import {
   timeUntil,
   type Claim,
   type Claimer,
+  type Deposit,
   type MyPayout,
   type ProductRequest,
   type SharedCode,
@@ -56,6 +58,8 @@ export function MinePage({ user, version, onChanged }: Props) {
   const [requests, setRequests] = useState<ProductRequest[] | null>(null)
   const [requesting, setRequesting] = useState(false)
   const [reqVersion, setReqVersion] = useState(0)
+  const [deposits, setDeposits] = useState<Deposit[]>([])
+  const [refunding, setRefunding] = useState<string | null>(null)
 
   useEffect(() => {
     if (!user) return
@@ -72,6 +76,10 @@ export function MinePage({ user, version, onChanged }: Props) {
       .myClaimed()
       .then((r) => setClaims(r.claims))
       .catch(() => setClaims([]))
+    api
+      .myDeposits()
+      .then((r) => setDeposits(r.deposits))
+      .catch(() => setDeposits([]))
   }, [user, version])
 
   useEffect(() => {
@@ -145,6 +153,21 @@ export function MinePage({ user, version, onChanged }: Props) {
     }
   }
 
+  const refund = async (id: string) => {
+    setRefunding(id)
+    try {
+      await api.refundDeposit(id)
+      toast('押金已原路退回')
+      onChanged()
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : '没退成')
+    } finally {
+      setRefunding(null)
+    }
+  }
+
+  const idleDeposits = deposits.filter((d) => d.status === 'paid').length
+
   const pendingRequests = requests?.filter((r) => r.status === 'pending').length ?? 0
 
   const byCode = (id: string) => claimers.filter((x) => x.code_id === id)
@@ -159,6 +182,12 @@ export function MinePage({ user, version, onChanged }: Props) {
           我的申请
           {pendingRequests ? <Badge variant="secondary">{pendingRequests}</Badge> : null}
         </TabsTrigger>
+        {deposits.length ? (
+          <TabsTrigger value="deposits">
+            押金
+            {idleDeposits ? <Badge variant="secondary">{idleDeposits}</Badge> : null}
+          </TabsTrigger>
+        ) : null}
       </TabsList>
 
       <TabsContent value="shared" className="flex flex-col gap-6">
@@ -307,6 +336,7 @@ export function MinePage({ user, version, onChanged }: Props) {
                       {c.void_at ? (
                         <span className="text-xs text-muted-foreground">这个码已确认无效，可以去广场再领一个。</span>
                       ) : null}
+                      <DepositNote claim={c} />
                     </div>
                     <div className="flex flex-wrap gap-2">
                       <CopyButton value={c.code} label="复制" />
@@ -383,6 +413,72 @@ export function MinePage({ user, version, onChanged }: Props) {
         </Card>
       </TabsContent>
 
+      {deposits.length ? (
+        <TabsContent value="deposits">
+          <Card>
+            <CardHeader>
+              <CardTitle>接力押金</CardTitle>
+              <CardDescription>
+                领接力产品前付的押金。领到后把你自己的同产品邀请码放进分享，被别人领走、过了观察期没人反馈无效，押金自动原路退回。
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>产品</TableHead>
+                    <TableHead>押金</TableHead>
+                    <TableHead>状态</TableHead>
+                    <TableHead className="text-right">操作</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {deposits.map((d) => (
+                    <TableRow key={d.id}>
+                      <TableCell className="font-medium">{d.product}</TableCell>
+                      <TableCell className="tabular-nums">{ldc(d.amount_cents)} LDC</TableCell>
+                      <TableCell>
+                        <div className="flex flex-col gap-0.5">
+                          <Badge
+                            variant={
+                              d.status === 'refunded'
+                                ? 'secondary'
+                                : d.status === 'refund_failed' || d.status === 'forfeited'
+                                  ? 'destructive'
+                                  : 'outline'
+                            }
+                          >
+                            {d.status === 'used' && d.relayed ? '已放回码，等人领走' : DEPOSIT_STATUS[d.status]}
+                          </Badge>
+                          {d.status === 'refund_due' && d.refund_due_at ? (
+                            <span className="text-xs text-muted-foreground">预计 {timeUntil(d.refund_due_at)}退回</span>
+                          ) : null}
+                          {d.status === 'refund_failed' && d.error ? (
+                            <span className="text-xs text-muted-foreground">{d.error}</span>
+                          ) : null}
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {d.status === 'paid' ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={refunding === d.id}
+                            onClick={() => refund(d.id)}
+                          >
+                            {refunding === d.id ? '退回中…' : '退回押金'}
+                          </Button>
+                        ) : null}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      ) : null}
+
       <RequestProductDialog
         open={requesting}
         onClose={() => setRequesting(false)}
@@ -429,6 +525,20 @@ export function MinePage({ user, version, onChanged }: Props) {
       />
     </Tabs>
   )
+}
+
+function DepositNote({ claim: c }: { claim: Claim }) {
+  if (!c.deposit_status || !c.deposit_cents) return null
+  const amount = `${ldc(c.deposit_cents)} LDC 押金`
+  const text =
+    c.deposit_status === 'used'
+      ? c.relayed
+        ? `已放回你的 ${c.product} 码，等别人领走后退 ${amount}`
+        : `还没放回你自己的 ${c.product} 码：去「分享」放进去，被领走后退 ${amount}`
+      : c.deposit_status === 'refund_due'
+        ? `你放回的码已被领走，${amount}${c.refund_due_at ? ` ${timeUntil(c.refund_due_at)}` : ''}退回`
+        : `${amount}：${DEPOSIT_STATUS[c.deposit_status]}`
+  return <span className="text-xs text-foreground">{text}</span>
 }
 
 function ReportBadge({ claim }: { claim: Claim }) {
