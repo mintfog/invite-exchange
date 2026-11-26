@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Coins, Gift, Heart, Repeat, Search } from 'lucide-react'
+import { BellRing, Coins, Gift, Heart, Link2, Repeat, Search, Users } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -20,6 +20,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 
 import { CopyButton } from '@/components/copy-button'
 import { ReportDialog } from '@/components/report-dialog'
+import { prepareQueueAlerts } from '@/lib/queue-alerts'
 import {
   api,
   ApiError,
@@ -51,6 +52,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
   const [reporting, setReporting] = useState<NewClaim | null>(null)
   const [requesting, setRequesting] = useState(false)
   const [depositFor, setDepositFor] = useState<Product | null>(null)
+  const [queueFor, setQueueFor] = useState<Product | null>(null)
   const [paying, setPaying] = useState(false)
 
   useEffect(() => {
@@ -102,6 +104,24 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
       setPaying(false)
       if (e instanceof ApiError && e.code === 'has_deposit') {
         setDepositFor(null)
+        onChanged()
+      }
+      toast.error(e instanceof ApiError ? e.message : '没打开付款页面')
+    }
+  }
+
+  // 排队：先请求通知权限（必须在点击里），再跳去付排队押金
+  const doQueue = async () => {
+    if (!queueFor) return
+    prepareQueueAlerts()
+    setPaying(true)
+    try {
+      const r = await api.payDeposit(queueFor.key, true)
+      window.location.href = r.url
+    } catch (e) {
+      setPaying(false)
+      if (e instanceof ApiError && ['has_deposit', 'not_empty'].includes(e.code)) {
+        setQueueFor(null)
         onChanged()
       }
       toast.error(e instanceof ApiError ? e.message : '没打开付款页面')
@@ -224,11 +244,25 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
                   </div>
                   <RewardLine product={p} />
                   <RelayLine product={p} />
-                  {p.deposit_base_cents !== null && p.available - p.mine_available <= 0 ? (
+                  {p.deposit_base_cents !== null ? (
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-foreground">
+                      <span className="flex items-center gap-1">
+                        <Link2 className="size-4" />
+                        当前 {p.relay_chains} 条接力链
+                      </span>
+                      {p.queue_count > 0 ? (
+                        <span className="flex items-center gap-1">
+                          <Users className="size-4" />
+                          {p.queue_count} 人在排队{p.my_queue_pos ? `，你排第 ${p.my_queue_pos} 位` : ''}
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {p.deposit_base_cents !== null && p.available - p.mine_available <= 0 && !p.my_queue_pos ? (
                     <span className="text-foreground">
                       {p.waiting_relays > 0
-                        ? `已有 ${p.waiting_relays} 人付了押金领走码、还没放回自己的码，可以稍后再来看看`
-                        : '码暂时领完了，等有人放回码后再来看看'}
+                        ? `已有 ${p.waiting_relays} 人付了押金领走码、还没放回自己的码，可以稍后再来看看，或者排队等码`
+                        : '码暂时领完了，等有人放回码后再来看看，或者排队等码'}
                     </span>
                   ) : null}
                 </CardContent>
@@ -240,6 +274,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
                     loading={claiming === p.key}
                     onClaim={() => doClaim(p)}
                     onDeposit={() => setDepositFor(p)}
+                    onQueue={() => setQueueFor(p)}
                   />
                 </CardFooter>
               </Card>
@@ -338,6 +373,36 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
         </DialogContent>
       </Dialog>
 
+      <Dialog open={!!queueFor} onOpenChange={(o) => !o && !paying && setQueueFor(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>排队等 {queueFor?.name} 的码</DialogTitle>
+            <DialogDescription>
+              现在池子里没有码。付 {ldc(queueFor?.queue_deposit_cents)} LDC 排队押金（正常押金{' '}
+              {ldc(queueFor?.deposit_cents)} 加排队{' '}
+              {ldc((queueFor?.queue_deposit_cents ?? 0) - (queueFor?.deposit_cents ?? 0))} LDC），有人放回码时按排队顺序自动发给你。
+            </DialogDescription>
+          </DialogHeader>
+          <ol className="flex list-decimal flex-col gap-1 pl-5 text-sm text-muted-foreground">
+            <li>有人排队时，每放回 3 个码，2 个留给现领的人，1 个按付款先后发给排队的人。码放回 10 分钟没人现领，也直接发给排队的人。</li>
+            <li>排到时网页会响铃、弹出系统通知，码会出现在「我的 → 我领到的」。网页开着才能听到提醒，允许通知会更稳。</li>
+            <li>用码注册后放回你自己的码，它被别人领走、过了观察期，排队押金全部原路退回。</li>
+          </ol>
+          <p className="text-sm text-muted-foreground">
+            还没排到时，可以在「我的 → 押金」里取消排队，押金全部退回。
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setQueueFor(null)} disabled={paying}>
+              先不排
+            </Button>
+            <Button onClick={doQueue} disabled={paying}>
+              <BellRing />
+              {paying ? '正在打开付款页…' : `付 ${ldc(queueFor?.queue_deposit_cents)} LDC 排队`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <RequestProductDialog open={requesting} initialName={query.trim()} onClose={() => setRequesting(false)} />
     </div>
   )
@@ -361,7 +426,9 @@ function RelayLine({ product: p }: { product: Product }) {
   const tiers = p.deposit_tiers
     .map((t) => `${t.level} 级${t.cents ? ` ${ldc(t.cents)}` : '免押金'}`)
     .join('，')
-  const mine = p.has_deposit
+  const mine = p.my_queue_pos
+    ? '你的排队押金已付，排到会自动发给你；有码时也可以直接领'
+    : p.has_deposit
     ? '你的押金已付，可以领了'
     : p.deposit_cents === null
       ? '你的等级够了，免押金'
@@ -394,6 +461,7 @@ function ClaimButton({
   loading,
   onClaim,
   onDeposit,
+  onQueue,
 }: {
   product: Product
   user: User | null
@@ -401,6 +469,7 @@ function ClaimButton({
   loading: boolean
   onClaim: () => void
   onDeposit: () => void
+  onQueue: () => void
 }) {
   if (!user) {
     return (
@@ -417,6 +486,27 @@ function ClaimButton({
     )
   }
   const othersAvailable = product.available - product.mine_available
+  if (othersAvailable <= 0 && product.my_queue_pos) {
+    return (
+      <Button variant="secondary" className="w-full" disabled>
+        排队中：第 {product.my_queue_pos} 位
+      </Button>
+    )
+  }
+  if (
+    othersAvailable <= 0 &&
+    product.available <= 0 &&
+    product.queue_deposit_cents !== null &&
+    !lowTrust &&
+    !product.has_deposit
+  ) {
+    return (
+      <Button variant="outline" className="w-full" onClick={onQueue}>
+        <BellRing />
+        付 {ldc(product.queue_deposit_cents)} LDC 排队
+      </Button>
+    )
+  }
   if (othersAvailable <= 0) {
     return (
       <Button variant="secondary" className="w-full" disabled>

@@ -1342,6 +1342,7 @@ function RelayPanel({ version, onChanged }: { version: number; onChanged: () => 
   const [settings, setSettings] = useState<Settings | null>(null)
   const [configured, setConfigured] = useState<boolean | null>(null)
   const [amount, setAmount] = useState('')
+  const [premium, setPremium] = useState('')
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState<'all' | DepositStatus>('all')
   const [deposits, setDeposits] = useState<AdminDeposit[] | null>(null)
@@ -1354,6 +1355,7 @@ function RelayPanel({ version, onChanged }: { version: number; onChanged: () => 
         setSettings(r.settings)
         setConfigured(r.ldc_configured)
         setAmount(ldc(r.settings.relay_deposit_cents))
+        setPremium(ldc(r.settings.queue_premium_cents))
       })
       .catch(() => setConfigured(false))
   }, [version])
@@ -1373,14 +1375,18 @@ function RelayPanel({ version, onChanged }: { version: number; onChanged: () => 
   const save = async (enabled?: boolean) => {
     const cents = parseLdc(amount)
     if (!cents) return toast.error('押金要是大于 0 的数字，最多两位小数')
+    const extra = parseLdc(premium)
+    if (!extra) return toast.error('排队加价要是大于 0 的数字，最多两位小数')
     setBusy(true)
     try {
       const r = await api.admin.saveSettings({
         relay_enabled: enabled ?? settings?.relay_enabled ?? false,
         relay_deposit_cents: cents,
+        queue_premium_cents: extra,
       })
       setSettings(r.settings)
       setAmount(ldc(r.settings.relay_deposit_cents))
+      setPremium(ldc(r.settings.queue_premium_cents))
       toast(enabled === undefined ? '已保存' : enabled ? '接力已开启' : '接力已关闭')
       onChanged()
     } catch (e) {
@@ -1463,13 +1469,20 @@ function RelayPanel({ version, onChanged }: { version: number; onChanged: () => 
                   {settings.relay_enabled ? '已开启' : '已关闭'}
                 </Badge>
               </div>
-              <div className="max-w-xs">
+              <div className="grid max-w-xl gap-4 sm:grid-cols-2">
                 <Field
                   id="r-amount"
                   label="默认押金（LDC）"
                   hint="产品没单独设押金时用这个；产品里还可以按信任等级分档减免"
                   value={amount}
                   onChange={setAmount}
+                />
+                <Field
+                  id="r-premium"
+                  label="排队加价（LDC）"
+                  hint="没码时排队要比正常押金多付这么多；接力完成后和押金一起退"
+                  value={premium}
+                  onChange={setPremium}
                 />
               </div>
               <div>
@@ -1527,7 +1540,10 @@ function RelayPanel({ version, onChanged }: { version: number; onChanged: () => 
                       <UserCell name={d.username} avatar={d.avatar_url} />
                     </TableCell>
                     <TableCell>
-                      <div className="font-medium">{d.product}</div>
+                      <div className="flex items-center gap-2 font-medium">
+                        {d.product}
+                        {d.queued ? <Badge variant="outline">排队</Badge> : null}
+                      </div>
                       <div className="text-xs text-muted-foreground">付于 {timeAgo(d.paid_at ?? d.created_at)}</div>
                     </TableCell>
                     <TableCell className="tabular-nums">{ldc(d.amount_cents)} LDC</TableCell>

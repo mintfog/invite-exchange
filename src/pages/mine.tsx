@@ -419,7 +419,7 @@ export function MinePage({ user, version, onChanged }: Props) {
             <CardHeader>
               <CardTitle>接力押金</CardTitle>
               <CardDescription>
-                领接力产品前付的押金。领到后把你自己的同产品邀请码放进分享，被别人领走、过了观察期没人反馈无效，押金自动原路退回。
+                领接力产品前付的押金和排队押金。领到后把你自己的同产品邀请码放进分享，被别人领走、过了观察期没人反馈无效，押金自动原路退回。
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -435,7 +435,12 @@ export function MinePage({ user, version, onChanged }: Props) {
                 <TableBody>
                   {deposits.map((d) => (
                     <TableRow key={d.id}>
-                      <TableCell className="font-medium">{d.product}</TableCell>
+                      <TableCell className="font-medium">
+                        <div className="flex items-center gap-2">
+                          {d.product}
+                          {d.queued ? <Badge variant="outline">排队</Badge> : null}
+                        </div>
+                      </TableCell>
                       <TableCell className="tabular-nums">{ldc(d.amount_cents)} LDC</TableCell>
                       <TableCell>
                         <div className="flex flex-col gap-0.5">
@@ -448,7 +453,11 @@ export function MinePage({ user, version, onChanged }: Props) {
                                   : 'outline'
                             }
                           >
-                            {d.status === 'used' && d.relayed ? '已放回码，等人领走' : DEPOSIT_STATUS[d.status]}
+                            {d.status === 'used' && d.relayed
+                              ? '已放回码，等人领走'
+                              : d.status === 'paid' && d.queued
+                                ? '排队中'
+                                : DEPOSIT_STATUS[d.status]}
                           </Badge>
                           {d.status === 'refund_due' && d.refund_due_at ? (
                             <span className="text-xs text-muted-foreground">预计 {timeUntil(d.refund_due_at)}退回</span>
@@ -466,7 +475,7 @@ export function MinePage({ user, version, onChanged }: Props) {
                             disabled={refunding === d.id}
                             onClick={() => refund(d.id)}
                           >
-                            {refunding === d.id ? '退回中…' : '退回押金'}
+                            {refunding === d.id ? '退回中…' : d.queued ? '取消排队并退回' : '退回押金'}
                           </Button>
                         ) : null}
                       </TableCell>

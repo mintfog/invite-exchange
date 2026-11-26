@@ -1009,6 +1009,82 @@ try {
     assert.equal((await view(t4)).deposit_cents, 300)
     ok('产品最低等级可以低于全站；清掉分档和产品押金后回到全站押金')
 
+    // 预约排队：没码时多付押金排队，每 3 个码 2 个给现领、1 个给排队
+    assert.equal((await boss.json('/api/admin/settings', 'PUT', { queue_premium_cents: 0 })).data.error, 'bad_queue_premium')
+    assert.equal((await boss.json('/api/admin/settings', 'PUT', { queue_premium_cents: 200 })).status, 200)
+    const qk = (await mkp({ name: 'Queue', relay_required: true })).data.key
+    const qseed = await new Client().devLogin('q-seed')
+    const [qd1, qd2, qd3, qA, qB] = await Promise.all(['q-d1', 'q-d2', 'q-d3', 'q-a', 'q-b'].map((n) => new Client().devLogin(n)))
+    await qseed.json('/api/codes', 'POST', { product_key: qk, codes: 'Q-0' })
+    const qview = async (cl) => (await cl.json('/api/products')).data.products.find((p) => p.key === qk)
+    assert.equal((await qA.json(`/api/products/${qk}/deposit`, 'POST', { queue: true })).data.error, 'not_empty')
+    assert.equal((await qA.json('/api/products/quick/deposit', 'POST', { queue: true })).data.error, 'no_queue')
+    const direct = async (cl, code) => {
+      const r = await cl.json(`/api/products/${qk}/deposit`, 'POST')
+      assert.equal(r.status, 200, JSON.stringify(r.data))
+      await notify(Object.fromEntries(new URL(r.data.url).searchParams))
+      const c = await cl.json('/api/claim', 'POST', { product_key: qk })
+      assert.equal(c.status, 200, JSON.stringify(c.data))
+      assert.equal(c.data.claim.code, code)
+    }
+    await direct(qd1, 'Q-0')
+    let qv = await qview(qA)
+    assert.equal(qv.available, 0)
+    assert.equal(qv.relay_chains, 1)
+    assert.equal(qv.queue_deposit_cents, 500)
+    assert.equal((await qA.json(`/api/products/${qk}/deposit`, 'POST')).data.error, 'empty')
+    const join = async (cl) => {
+      const r = await cl.json(`/api/products/${qk}/deposit`, 'POST', { queue: true })
+      assert.equal(r.status, 200, JSON.stringify(r.data))
+      assert.equal(r.data.queued, true)
+      const q = Object.fromEntries(new URL(r.data.url).searchParams)
+      assert.equal(q.money, '5.00')
+      assert.match(q.name, /排队/)
+      await notify(q)
+    }
+    await join(qA)
+    await join(qB)
+    qv = await qview(qB)
+    assert.equal(qv.queue_count, 2)
+    assert.equal(qv.my_queue_pos, 2)
+    assert.equal((await qview(qA)).my_queue_pos, 1)
+    assert.equal((await qA.json(`/api/products/${qk}/deposit`, 'POST', { queue: true })).data.error, 'has_deposit')
+    const myq = (await qA.json('/api/my/queue')).data
+    assert.equal(myq.waiting.length, 1)
+    assert.equal(myq.waiting[0].position, 1)
+    assert.equal(myq.served.length, 0)
+    ok('排队：有码时不能排，没码时付「押金 + 排队加价」进队，看得到自己排第几')
+
+    // 第 1、2 个放回的码留给现领，第 3 个发给排队的第一个人
+    await qd1.json('/api/codes', 'POST', { product_key: qk, codes: 'Q-1' })
+    assert.equal((await qA.json('/api/my/queue')).data.waiting.length, 1)
+    assert.equal((await qview(qA)).relay_chains, 1)
+    await direct(qd2, 'Q-1')
+    await qd2.json('/api/codes', 'POST', { product_key: qk, codes: 'Q-2' })
+    assert.equal((await qA.json('/api/my/queue')).data.waiting.length, 1)
+    await direct(qd3, 'Q-2')
+    await qd3.json('/api/codes', 'POST', { product_key: qk, codes: 'Q-3' })
+    const served = (await qA.json('/api/my/queue')).data
+    assert.equal(served.waiting.length, 0)
+    assert.equal(served.served.length, 1)
+    assert.equal(served.served[0].code, 'Q-3')
+    const qaDep = (await qA.json('/api/my/deposits')).data.deposits[0]
+    assert.equal(qaDep.queued, 1)
+    assert.equal(qaDep.status, 'used')
+    assert.equal((await qview(qB)).my_queue_pos, 1)
+    assert.equal((await qview(qB)).queue_count, 1)
+    ok('排队发码：每 3 个放回的码 2 个给现领、第 3 个自动发给排第一的人')
+
+    // 排到的码被别人领走后，排队押金（含加价）一起退
+    await qA.json('/api/codes', 'POST', { product_key: qk, codes: 'Q-A' })
+    const qbDep = (await qB.json('/api/my/deposits')).data.deposits[0]
+    assert.equal(qbDep.status, 'paid')
+    assert.equal((await qB.json(`/api/deposits/${qbDep.id}/refund`, 'POST')).status, 200)
+    assert.equal((await qview(qB)).queue_count, 0)
+    assert.equal((await qview(qB)).my_queue_pos, null)
+    ok('没排到可以取消排队，押金全部退回')
+    await boss.json('/api/admin/settings', 'PUT', { queue_premium_cents: 20000 })
+
     await boss.json('/api/admin/settings', 'PUT', { relay_enabled: false, hold_hours: 24 })
     const off = (await r1.json('/api/products')).data.products.find((p) => p.key === key)
     assert.equal(off.deposit_cents, null)

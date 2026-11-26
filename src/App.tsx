@@ -31,6 +31,7 @@ import { SquarePage } from '@/pages/square'
 import { SharePage } from '@/pages/share'
 import { MinePage } from '@/pages/mine'
 import { AdminPage } from '@/pages/admin'
+import { QueueWatcher } from '@/components/queue-watcher'
 
 type Tab = 'square' | 'share' | 'mine' | 'admin'
 const TABS: Tab[] = ['square', 'share', 'mine', 'admin']
@@ -234,6 +235,7 @@ export default function App() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <QueueWatcher user={user} version={version} onServed={refresh} onGoShare={() => go('share')} />
       <Toaster position="top-center" />
     </div>
   )

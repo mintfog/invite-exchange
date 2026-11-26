@@ -111,6 +111,7 @@ type Settings = {
   hold_hours: number
   relay_enabled: boolean
   relay_deposit_cents: number
+  queue_premium_cents: number
 }
 
 const SETTING_DEFAULTS: Settings = {
@@ -121,6 +122,7 @@ const SETTING_DEFAULTS: Settings = {
   hold_hours: 24,
   relay_enabled: false,
   relay_deposit_cents: 500,
+  queue_premium_cents: 20000,
 }
 
 async function getSettings(db: D1Database): Promise<Settings> {
@@ -138,6 +140,7 @@ async function getSettings(db: D1Database): Promise<Settings> {
     hold_hours: int('hold_hours'),
     relay_enabled: m.get('relay_enabled') === '1',
     relay_deposit_cents: int('relay_deposit_cents') || SETTING_DEFAULTS.relay_deposit_cents,
+    queue_premium_cents: int('queue_premium_cents') || SETTING_DEFAULTS.queue_premium_cents,
   }
 }
 
@@ -547,6 +550,14 @@ app.get('/products', async (c) => {
               WHERE d.product_key = p.key AND d.status = 'used' AND d.relay_code_id IS NULL) AS waiting_relays,
             EXISTS (SELECT 1 FROM relay_deposits d
                      WHERE d.user_id = ?1 AND d.product_key = p.key AND d.status = 'paid') AS has_deposit,
+            (SELECT COUNT(*) FROM relay_deposits q
+              WHERE q.product_key = p.key AND q.queued = 1 AND q.status = 'paid') AS queue_count,
+            (SELECT 1 + (SELECT COUNT(*) FROM relay_deposits q
+                          WHERE q.product_key = p.key AND q.queued = 1 AND q.status = 'paid'
+                            AND (q.paid_at < m.paid_at OR (q.paid_at = m.paid_at AND q.id < m.id)))
+               FROM relay_deposits m
+              WHERE m.user_id = ?1 AND m.product_key = p.key AND m.queued = 1 AND m.status = 'paid'
+              ORDER BY m.paid_at LIMIT 1) AS my_queue_pos,
             p.code_pattern IS NOT NULL AS has_pattern,
             (SELECT COUNT(*) FROM codes c WHERE c.product_key = p.key AND c.status = 'available') AS available_codes,
             (SELECT COALESCE(SUM(${REMAINING}), 0) FROM codes c
@@ -572,6 +583,8 @@ app.get('/products', async (c) => {
       own_deposit_cents: number | null
       own_min_trust: number | null
       deposit_tiers: string | null
+      available_codes: number
+      waiting_relays: number
     }>()
   const settings = await getSettings(c.env.DB)
   const on = settings.ldc_enabled && ldcConfigured(c.env)
@@ -582,8 +595,13 @@ app.get('/products', async (c) => {
       c.env,
       user?.trust_level ?? null,
     )
+    const relay = r.base !== null
     return {
       ...p,
+      // 接力链：池子里能领的码 + 已被领走、还没放回下一个码的。每条链同一时间只有一个码在流转。
+      relay_chains: relay ? Number(p.available_codes) + Number(p.waiting_relays) : 0,
+      // 排队押金 = 正常押金 + 排队加价
+      queue_deposit_cents: relay ? (user ? (r.deposit ?? 0) : r.base!) + settings.queue_premium_cents : null,
       share_reward_cents: on ? (p.share_reward_cents ?? settings.share_reward_cents) : 0,
       claim_reward_cents: on ? (p.claim_reward_cents ?? settings.claim_reward_cents) : 0,
       min_trust_level: r.minTrust,
@@ -700,6 +718,7 @@ app.post('/codes', async (c) => {
       .run()
     relayed = r.meta.changes ?? 0
   }
+  if (added) await serveQueue(c.env, product.key, waitUntilOf(c))
   return c.json({ added, duplicates: codes.length - added, product_key: product.key, relayed })
 })
 
@@ -750,6 +769,10 @@ app.patch('/codes/:id', async (c) => {
     .bind(row.used + remaining, remaining, row.id, row.used)
     .run()
   if (!r.meta.changes) return fail(c, 409, 'changed', '刚好有人领了这个码，请刷新后再改')
+  if (remaining > 0) {
+    const k = await c.env.DB.prepare('SELECT product_key FROM codes WHERE id = ?').bind(row.id).first<{ product_key: string }>()
+    if (k) await serveQueue(c.env, k.product_key, waitUntilOf(c))
+  }
   return c.json({ ok: true, remaining })
 })
 
@@ -897,6 +920,7 @@ const epayBase = (env: Env) => `${(env.LDC_BASE || 'https://credit.linux.do').re
 
 type DepositRow = {
   id: string
+  queued: number
   user_id: number
   product_key: string
   amount_cents: number
@@ -975,6 +999,7 @@ app.post('/products/:key/deposit', async (c) => {
   const user = requireUser(c)
   if (!user) return fail(c, 401, 'login_required', '请先登录')
   const key = c.req.param('key')
+  const queue = Boolean((await c.req.json<{ queue?: unknown }>().catch(() => null))?.queue)
   const product = await c.env.DB.prepare('SELECT name FROM products WHERE key = ? AND active = 1')
     .bind(key)
     .first<{ name: string }>()
@@ -983,7 +1008,10 @@ app.post('/products/:key/deposit', async (c) => {
   if (user.trust_level < rules.minTrust) {
     return fail(c, 403, 'trust_level', `LinuxDO 信任等级达到 ${rules.minTrust} 级才能领 ${product.name}`)
   }
-  const amount = rules.deposit
+  if (queue && rules.base === null) return fail(c, 409, 'no_queue', `${product.name} 不用接力，没有排队`)
+  const premium = queue ? (await getSettings(c.env.DB)).queue_premium_cents : 0
+  // 排队押金 = 你领这个产品的正常押金 + 排队加价，放回码被别人领走后一起退
+  const amount = (rules.deposit ?? 0) + premium
   if (!amount) return fail(c, 409, 'no_deposit_needed', `你领 ${product.name} 不用押金`)
   if (!ldcConfigured(c.env)) return fail(c, 409, 'ldc_not_configured', '站点还没接上 LINUX DO Credit，暂时付不了押金')
   const db = c.env.DB
@@ -996,7 +1024,12 @@ app.post('/products/:key/deposit', async (c) => {
       .bind(user.id, key)
       .first()
   ) {
-    return fail(c, 409, 'has_deposit', '押金已经付过了，直接领取就行')
+    return fail(
+      c,
+      409,
+      'has_deposit',
+      queue ? '你已经付过这个产品的押金了，有码时直接领就行；想排队可以先在「我的」里退回押金' : '押金已经付过了，直接领取就行',
+    )
   }
   const pool = await db
     .prepare(
@@ -1004,7 +1037,8 @@ app.post('/products/:key/deposit', async (c) => {
     )
     .bind(key, user.id)
     .first()
-  if (!pool) return fail(c, 409, 'empty', '现在没有可领的码，先别付押金')
+  if (queue && pool) return fail(c, 409, 'not_empty', '现在有码可以领，不用排队，直接领就行')
+  if (!queue && !pool) return fail(c, 409, 'empty', '现在没有可领的码，先别付押金')
 
   const t = now()
   const recent = await db
@@ -1015,16 +1049,16 @@ app.post('/products/:key/deposit', async (c) => {
   const id = `dep-${crypto.randomUUID()}`
   await db
     .prepare(
-      `INSERT INTO relay_deposits (id, user_id, product_key, amount_cents, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+      `INSERT INTO relay_deposits (id, user_id, product_key, amount_cents, status, queued, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
     )
-    .bind(id, user.id, key, amount, t, t)
+    .bind(id, user.id, key, amount, queue ? 1 : 0, t, t)
     .run()
   const origin = new URL(c.req.url).origin
   const params: Record<string, string> = {
     pid: c.env.LDC_CLIENT_ID!,
     type: 'epay',
-    name: `${product.name} 邀请码接力押金`.slice(0, 60),
+    name: `${product.name} 邀请码${queue ? '排队' : '接力'}押金`.slice(0, 60),
     money: cents(amount),
     out_trade_no: id,
     notify_url: `${origin}/api/ldc/notify`,
@@ -1032,7 +1066,12 @@ app.post('/products/:key/deposit', async (c) => {
     sign_type: 'MD5',
   }
   params.sign = await epaySign(params, c.env.LDC_CLIENT_SECRET!)
-  return c.json({ url: `${epayBase(c.env)}/pay/submit.php?${new URLSearchParams(params)}`, id, amount_cents: amount })
+  return c.json({
+    url: `${epayBase(c.env)}/pay/submit.php?${new URLSearchParams(params)}`,
+    id,
+    amount_cents: amount,
+    queued: queue,
+  })
 })
 
 // LINUX DO Credit 付款成功的异步通知（GET）。验签、核对商户号和金额后记为已付。必须回纯文本 success。
@@ -1058,6 +1097,8 @@ app.get('/ldc/notify', async (c) => {
   )
     .bind(q.trade_no ?? null, t, t, d.id)
     .run()
+  // 排队押金付好了：如果刚好有码、又轮到排队，马上发
+  if (d.queued) await serveQueue(c.env, d.product_key, waitUntilOf(c))
   return c.text('success')
 })
 
@@ -1065,7 +1106,7 @@ app.get('/my/deposits', async (c) => {
   const user = requireUser(c)
   if (!user) return fail(c, 401, 'login_required', '请先登录')
   const { results } = await c.env.DB.prepare(
-    `SELECT d.id, d.product_key, p.name AS product, d.amount_cents, d.status, d.claim_id,
+    `SELECT d.id, d.product_key, p.name AS product, d.amount_cents, d.status, d.claim_id, d.queued,
             d.relay_code_id IS NOT NULL AS relayed, d.refund_due_at, d.error, d.created_at, d.paid_at, d.refunded_at
        FROM relay_deposits d JOIN products p ON p.key = d.product_key
       WHERE d.user_id = ? AND d.status <> 'pending'
@@ -1074,6 +1115,40 @@ app.get('/my/deposits', async (c) => {
     .bind(user.id)
     .all()
   return c.json({ deposits: results })
+})
+
+// 预约排队：我在排的队（顺便看看有没有轮到我），和最近排到的码。网页开着时每隔一会儿查一次。
+app.get('/my/queue', async (c) => {
+  const user = requireUser(c)
+  if (!user) return fail(c, 401, 'login_required', '请先登录')
+  const db = c.env.DB
+  const mine = await db
+    .prepare("SELECT DISTINCT product_key FROM relay_deposits WHERE user_id = ? AND queued = 1 AND status = 'paid'")
+    .bind(user.id)
+    .all<{ product_key: string }>()
+  for (const r of mine.results) await serveQueue(c.env, r.product_key, waitUntilOf(c))
+  const { results: waiting } = await db
+    .prepare(
+      `SELECT d.id, d.product_key, p.name AS product, d.amount_cents, d.paid_at,
+              1 + (SELECT COUNT(*) FROM relay_deposits q
+                    WHERE q.product_key = d.product_key AND q.queued = 1 AND q.status = 'paid'
+                      AND (q.paid_at < d.paid_at OR (q.paid_at = d.paid_at AND q.id < d.id))) AS position
+         FROM relay_deposits d JOIN products p ON p.key = d.product_key
+        WHERE d.user_id = ? AND d.queued = 1 AND d.status = 'paid'
+        ORDER BY d.paid_at`,
+    )
+    .bind(user.id)
+    .all()
+  const { results: served } = await db
+    .prepare(
+      `SELECT d.id, x.id AS claim_id, p.name AS product, x.code, x.claimed_at
+         FROM relay_deposits d JOIN claims x ON x.id = d.claim_id JOIN products p ON p.key = d.product_key
+        WHERE d.user_id = ? AND d.queued = 1 AND x.void_at IS NULL AND x.claimed_at > ?
+        ORDER BY x.claimed_at DESC LIMIT 20`,
+    )
+    .bind(user.id, now() - 7 * DAY)
+    .all()
+  return c.json({ waiting, served })
 })
 
 // 押金付了但没用上（没领到码、领到的码被确认无效），可以自己退回
@@ -1090,6 +1165,154 @@ app.post('/deposits/:id/refund', async (c) => {
   if (!r.ok) return fail(c, 409, 'refund_failed', `退款没成功：${r.error}`)
   return c.json({ ok: true })
 })
+
+// ---------- 发码（现领和排队共用） ----------
+
+type Granted = { id: string; code_id: string; code: string; claimed_at: number }
+type WaitUntil = ((p: Promise<unknown>) => void) | undefined
+
+function waitUntilOf(c: { executionCtx: { waitUntil(p: Promise<unknown>): void } }): WaitUntil {
+  try {
+    const ctx = c.executionCtx
+    return (p) => ctx.waitUntil(p)
+  } catch {
+    return undefined // 没有执行上下文（比如测试里）就等定时任务
+  }
+}
+
+// 给一个人发一个码，并处理奖励和接力押金。maxClaims = null 表示不受每日上限限制（排队的人）。
+async function grantCode(
+  env: Env,
+  userId: number,
+  key: string,
+  depositId: string | null,
+  maxClaims: number | null,
+  waitUntil: WaitUntil,
+): Promise<Granted | null> {
+  const t = now()
+  // 一条语句完成：挑码 → 确认我没领过这个产品 → 确认没超每日上限 → 记一次领取。
+  // 挑码时优先给被领得最少的分享者，同样少的随机挑，让每个分享者都能轮到。
+  // 码用满时由触发器在同一条语句里标记为 claimed，D1 串行执行写操作，不会超发。
+  const row = await env.DB.prepare(
+    `INSERT INTO claims (id, code_id, product_key, sharer_id, user_id, code, claimed_at)
+     SELECT ?1, c.id, c.product_key, c.sharer_id, ?2, c.code, ?3
+       FROM codes c JOIN products p ON p.key = c.product_key
+      WHERE c.product_key = ?4 AND c.status = 'available' AND c.sharer_id <> ?2 AND p.active = 1
+        AND ${REMAINING} > 0
+        AND NOT EXISTS (SELECT 1 FROM claims y WHERE y.user_id = ?2 AND y.product_key = ?4 AND y.void_at IS NULL)
+        AND (SELECT COUNT(*) FROM claims z WHERE z.user_id = ?2 AND z.claimed_at > ?5) < ?6
+      ORDER BY (SELECT COUNT(*) FROM claims s WHERE s.sharer_id = c.sharer_id AND s.product_key = c.product_key),
+               random()
+      LIMIT 1
+     RETURNING id, code_id, code, claimed_at`,
+  )
+    .bind(crypto.randomUUID(), userId, t, key, t - DAY, maxClaims ?? 1_000_000_000)
+    .first<Granted>()
+  if (!row) return null
+
+  await recordRewards(env.DB, row.id, t)
+  if (depositId) {
+    // 押金绑到这次领取；如果手上已经有这个产品还在池子里的码，直接算放回了
+    const own = await env.DB.prepare(
+      `SELECT c.id FROM codes c WHERE c.sharer_id = ? AND c.product_key = ? AND c.status = 'available'
+          AND NOT EXISTS (SELECT 1 FROM relay_deposits d WHERE d.relay_code_id = c.id) LIMIT 1`,
+    )
+      .bind(userId, key)
+      .first<{ id: string }>()
+    await env.DB.prepare(
+      "UPDATE relay_deposits SET status = 'used', claim_id = ?, relay_code_id = ?, updated_at = ? WHERE id = ? AND status = 'paid'",
+    )
+      .bind(row.id, own?.id ?? null, t, depositId)
+      .run()
+  }
+  // 领到的是别人用来接力的码：那个人的押金在观察期后退回
+  const s = await getSettings(env.DB)
+  await env.DB.prepare(
+    `UPDATE relay_deposits SET status = 'refund_due', refund_due_at = ?, updated_at = ?
+      WHERE relay_code_id = ? AND status = 'used'`,
+  )
+    .bind(t + s.hold_hours * 60 * 60 * 1000, t, row.code_id)
+    .run()
+  // 接力链：A 分享 → B 领了 A 的码 → B 放回自己的码 → 现在被领走。
+  // 说明 B 用 A 的码注册成功了，A 的押金不用再等观察期，马上退。
+  const proven = await env.DB.prepare(
+    `UPDATE relay_deposits SET refund_due_at = ?1, updated_at = ?1
+      WHERE status = 'refund_due' AND refund_due_at > ?1
+        AND relay_code_id IN (
+          SELECT x.code_id FROM claims x JOIN codes k ON k.id = ?2
+           WHERE x.user_id = k.sharer_id AND x.product_key = k.product_key AND x.void_at IS NULL)`,
+  )
+    .bind(t, row.code_id)
+    .run()
+  if (proven.meta.changes && waitUntil) waitUntil(runRefunds(env))
+  return row
+}
+
+// 有码没人现领多久后，就算没轮到也发给排队的人
+const QUEUE_STALE_MS = 10 * 60 * 1000
+
+// 预约排队：有人排队时，每 3 个码里 2 个留给现领、1 个发给排队的人（按付款先后）。
+// 码放进池子后 10 分钟都没人现领，也直接发给排队的人。
+export async function serveQueue(env: Env, key: string, waitUntil?: WaitUntil) {
+  let served = 0
+  for (let round = 0; round < 20; round++) {
+    const { results: queue } = await env.DB.prepare(
+      `SELECT id, user_id FROM relay_deposits
+        WHERE product_key = ? AND queued = 1 AND status = 'paid'
+        ORDER BY paid_at, id LIMIT 5`,
+    )
+      .bind(key)
+      .all<{ id: string; user_id: number }>()
+    if (queue.length === 0) {
+      if (served) await env.DB.prepare('UPDATE products SET queue_slot = 0 WHERE key = ?').bind(key).run()
+      break
+    }
+    const p = await env.DB.prepare(
+      `SELECT p.queue_slot,
+              MAX(COALESCE((SELECT MAX(x.claimed_at) FROM claims x WHERE x.product_key = p.key), 0),
+                  COALESCE((SELECT MIN(c.created_at) FROM codes c
+                             WHERE c.product_key = p.key AND c.status = 'available' AND ${REMAINING} > 0), 0)) AS since
+         FROM products p WHERE p.key = ? AND p.active = 1`,
+    )
+      .bind(key)
+      .first<{ queue_slot: number; since: number }>()
+    if (!p) break
+    const turn = p.queue_slot % 3 === 2 || p.since < now() - QUEUE_STALE_MS
+    if (!turn) break
+    let granted = false
+    for (const q of queue) {
+      // 排队期间已经领到这个产品了：退出排队，押金留着可以自己退
+      const had = await env.DB.prepare(
+        'SELECT 1 FROM claims WHERE user_id = ? AND product_key = ? AND void_at IS NULL',
+      )
+        .bind(q.user_id, key)
+        .first()
+      if (had) {
+        await env.DB.prepare('UPDATE relay_deposits SET queued = 0, updated_at = ? WHERE id = ?').bind(now(), q.id).run()
+        granted = true // 队伍变了，重新看一轮
+        break
+      }
+      if (await grantCode(env, q.user_id, key, q.id, null, waitUntil)) {
+        await env.DB.prepare('UPDATE products SET queue_slot = 0 WHERE key = ?').bind(key).run()
+        served++
+        granted = true
+        break
+      }
+    }
+    if (!granted) break // 池子里没有能发给排队的人的码
+  }
+  return served
+}
+
+// 定时任务：每个有人排队的产品看一遍
+export async function serveAllQueues(env: Env) {
+  const { results } = await env.DB.prepare(
+    "SELECT DISTINCT product_key FROM relay_deposits WHERE queued = 1 AND status = 'paid'",
+  ).all<{ product_key: string }>()
+  let served = 0
+  for (const r of results) served += await serveQueue(env, r.product_key)
+  return served
+}
 
 app.post('/claim', async (c) => {
   const user = requireUser(c)
@@ -1116,7 +1339,7 @@ app.post('/claim', async (c) => {
       .first()
     if (claimed) return fail(c, 409, 'already_claimed', '这个产品你已经领过一个了')
     deposit = await c.env.DB.prepare(
-      "SELECT id FROM relay_deposits WHERE user_id = ? AND product_key = ? AND status = 'paid' ORDER BY paid_at LIMIT 1",
+      "SELECT id FROM relay_deposits WHERE user_id = ? AND product_key = ? AND status = 'paid' ORDER BY queued, paid_at LIMIT 1",
     )
       .bind(user.id, key)
       .first<{ id: string }>()
@@ -1125,69 +1348,18 @@ app.post('/claim', async (c) => {
     }
   }
 
-  // 一条语句完成：挑码 → 确认我没领过这个产品 → 确认没超每日上限 → 记一次领取。
-  // 挑码时优先给被领得最少的分享者，同样少的随机挑，让每个分享者都能轮到。
-  // 码用满时由触发器在同一条语句里标记为 claimed，D1 串行执行写操作，不会超发。
-  const row = await c.env.DB.prepare(
-    `INSERT INTO claims (id, code_id, product_key, sharer_id, user_id, code, claimed_at)
-     SELECT ?1, c.id, c.product_key, c.sharer_id, ?2, c.code, ?3
-       FROM codes c JOIN products p ON p.key = c.product_key
-      WHERE c.product_key = ?4 AND c.status = 'available' AND c.sharer_id <> ?2 AND p.active = 1
-        AND ${REMAINING} > 0
-        AND NOT EXISTS (SELECT 1 FROM claims y WHERE y.user_id = ?2 AND y.product_key = ?4 AND y.void_at IS NULL)
-        AND (SELECT COUNT(*) FROM claims z WHERE z.user_id = ?2 AND z.claimed_at > ?5) < ?6
-      ORDER BY (SELECT COUNT(*) FROM claims s WHERE s.sharer_id = c.sharer_id AND s.product_key = c.product_key),
-               random()
-      LIMIT 1
-     RETURNING id, code_id, code, claimed_at`,
-  )
-    .bind(crypto.randomUUID(), user.id, t, key, t - DAY, maxClaims)
-    .first<{ id: string; code_id: string; code: string; claimed_at: number }>()
-
+  // 有人排队时先看是不是轮到排队的人（每 3 个码 1 个给排队）
+  await serveQueue(c.env, key, waitUntilOf(c))
+  const row = await grantCode(c.env, user.id, key, deposit?.id ?? null, maxClaims, waitUntilOf(c))
   if (row) {
-    await recordRewards(c.env.DB, row.id, t)
-    let depositInfo: { deposit_cents: number | null } = { deposit_cents: null }
-    if (deposit) {
-      // 押金绑到这次领取；如果手上已经有这个产品还在池子里的码，直接算放回了
-      const own = await c.env.DB.prepare(
-        `SELECT c.id FROM codes c WHERE c.sharer_id = ? AND c.product_key = ? AND c.status = 'available'
-            AND NOT EXISTS (SELECT 1 FROM relay_deposits d WHERE d.relay_code_id = c.id) LIMIT 1`,
-      )
-        .bind(user.id, key)
-        .first<{ id: string }>()
-      await c.env.DB.prepare(
-        "UPDATE relay_deposits SET status = 'used', claim_id = ?, relay_code_id = ?, updated_at = ? WHERE id = ? AND status = 'paid'",
-      )
-        .bind(row.id, own?.id ?? null, t, deposit.id)
-        .run()
-      depositInfo = { deposit_cents: depositCents }
-    }
-    // 领到的是别人用来接力的码：那个人的押金在观察期后退回
-    const s = await getSettings(c.env.DB)
+    // 现领成功：有人在排队就记一轮，轮到排队时把下一个码发给排队的人
     await c.env.DB.prepare(
-      `UPDATE relay_deposits SET status = 'refund_due', refund_due_at = ?, updated_at = ?
-        WHERE relay_code_id = ? AND status = 'used'`,
+      `UPDATE products SET queue_slot = queue_slot + 1
+        WHERE key = ? AND EXISTS (SELECT 1 FROM relay_deposits q WHERE q.product_key = products.key AND q.queued = 1 AND q.status = 'paid')`,
     )
-      .bind(t + s.hold_hours * 60 * 60 * 1000, t, row.code_id)
+      .bind(key)
       .run()
-    // 接力链：A 分享 → B 领了 A 的码 → B 放回自己的码 → 现在被领走。
-    // 说明 B 用 A 的码注册成功了，A 的押金不用再等观察期，马上退。
-    const proven = await c.env.DB.prepare(
-      `UPDATE relay_deposits SET refund_due_at = ?1, updated_at = ?1
-        WHERE status = 'refund_due' AND refund_due_at > ?1
-          AND relay_code_id IN (
-            SELECT x.code_id FROM claims x JOIN codes k ON k.id = ?2
-             WHERE x.user_id = k.sharer_id AND x.product_key = k.product_key AND x.void_at IS NULL)`,
-    )
-      .bind(t, row.code_id)
-      .run()
-    if (proven.meta.changes) {
-      try {
-        c.executionCtx.waitUntil(runRefunds(c.env))
-      } catch {
-        // 没有执行上下文（比如测试里）就等定时任务
-      }
-    }
+    await serveQueue(c.env, key, waitUntilOf(c))
     const info = await c.env.DB.prepare(
       `SELECT c.note, p.name AS product, p.mode, u.username AS sharer_username
          FROM codes c JOIN products p ON p.key = c.product_key JOIN users u ON u.id = c.sharer_id
@@ -1196,7 +1368,13 @@ app.post('/claim', async (c) => {
       .bind(row.code_id)
       .first<{ note: string | null; product: string; mode: Mode; sharer_username: string }>()
     return c.json({
-      claim: { id: row.id, code: row.code, claimed_at: row.claimed_at, ...info, ...depositInfo },
+      claim: {
+        id: row.id,
+        code: row.code,
+        claimed_at: row.claimed_at,
+        ...info,
+        deposit_cents: deposit ? depositCents : null,
+      },
     })
   }
 
@@ -1698,6 +1876,11 @@ admin.put('/settings', async (c) => {
     if (n === null) return fail(c, 400, 'bad_relay_deposit', '押金需要大于 0，最多两位小数')
     next.relay_deposit_cents = n
   }
+  if (body.queue_premium_cents !== undefined) {
+    const n = intIn(body.queue_premium_cents, 1, LIMITS.rewardCents)
+    if (n === null) return fail(c, 400, 'bad_queue_premium', '排队加价需要大于 0，最多两位小数')
+    next.queue_premium_cents = n
+  }
   const entries: [string, string][] = [
     ['ldc_enabled', next.ldc_enabled ? '1' : '0'],
     ['share_reward_cents', String(next.share_reward_cents)],
@@ -1706,6 +1889,7 @@ admin.put('/settings', async (c) => {
     ['hold_hours', String(next.hold_hours)],
     ['relay_enabled', next.relay_enabled ? '1' : '0'],
     ['relay_deposit_cents', String(next.relay_deposit_cents)],
+    ['queue_premium_cents', String(next.queue_premium_cents)],
   ]
   await c.env.DB.batch(
     entries.map(([k, v]) =>
@@ -1927,7 +2111,7 @@ admin.post('/product-requests/:id/reject', async (c) => {
 admin.get('/deposits', async (c) => {
   const status = c.req.query('status') ?? 'all'
   const { results } = await c.env.DB.prepare(
-    `SELECT d.id, d.amount_cents, d.status, d.trade_no, d.claim_id, d.relay_code_id IS NOT NULL AS relayed,
+    `SELECT d.id, d.amount_cents, d.status, d.trade_no, d.claim_id, d.queued, d.relay_code_id IS NOT NULL AS relayed,
             d.refund_due_at, d.error, d.attempts, d.created_at, d.paid_at, d.refunded_at,
             p.name AS product, u.username, u.avatar_url,
             (SELECT COUNT(*) FROM claims y WHERE y.code_id = d.relay_code_id) AS relay_claims
@@ -1976,6 +2160,7 @@ export default {
     if (e.cron === '0 19 * * *') {
       await env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(now()).run()
     }
+    await serveAllQueues(env)
     await runPayouts(env)
     await runRefunds(env)
   },

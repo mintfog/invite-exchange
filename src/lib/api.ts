@@ -41,6 +41,14 @@ export type Product = {
   deposit_cents: number | null
   /** 我已经付好、还没用的押金 */
   has_deposit: number
+  /** 接力产品当前的接力链数：池里能领的码 + 已领走还没放回的 */
+  relay_chains: number
+  /** 正在排队的人数 */
+  queue_count: number
+  /** 我在队里排第几；没排队是 null */
+  my_queue_pos: number | null
+  /** 排队要付的押金（分）= 正常押金 + 排队加价；不是接力产品是 null */
+  queue_deposit_cents: number | null
 }
 
 export type DepositTier = { level: number; cents: number }
@@ -147,6 +155,8 @@ export type Deposit = {
   amount_cents: number
   status: DepositStatus
   claim_id: string | null
+  /** 1 = 排队押金 */
+  queued: number
   relayed: number
   refund_due_at: number | null
   error: string | null
@@ -265,6 +275,24 @@ export type Settings = {
   hold_hours: number
   relay_enabled: boolean
   relay_deposit_cents: number
+  queue_premium_cents: number
+}
+
+export type QueueWaiting = {
+  id: string
+  product_key: string
+  product: string
+  amount_cents: number
+  paid_at: number
+  position: number
+}
+
+export type QueueServed = {
+  id: string
+  claim_id: string
+  product: string
+  code: string | null
+  claimed_at: number
 }
 
 export type PayoutStats = {
@@ -368,8 +396,12 @@ export const api = {
   myShared: () =>
     request<{ codes: SharedCode[]; claimers: Claimer[]; summary: SharedSummary; payouts: MyPayout[] }>('/my/shared'),
   myClaimed: () => request<{ claims: Claim[] }>('/my/claimed'),
-  payDeposit: (product_key: string) =>
-    post<{ url: string; id: string; amount_cents: number }>(`/products/${encodeURIComponent(product_key)}/deposit`),
+  payDeposit: (product_key: string, queue = false) =>
+    post<{ url: string; id: string; amount_cents: number; queued: boolean }>(
+      `/products/${encodeURIComponent(product_key)}/deposit`,
+      queue ? { queue: true } : undefined,
+    ),
+  myQueue: () => request<{ waiting: QueueWaiting[]; served: QueueServed[] }>('/my/queue'),
   myDeposits: () => request<{ deposits: Deposit[] }>('/my/deposits'),
   refundDeposit: (id: string) => post<{ ok: true }>(`/deposits/${id}/refund`),
   requestProduct: (b: NewProductRequest) => post<{ id: string }>('/product-requests', b),
