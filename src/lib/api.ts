@@ -29,11 +29,19 @@ export type Product = {
   mine_codes: number
   i_claimed: number
   last_shared_at: number | null
-  /** 要接力的产品：领之前要付的押金（分）；不需要是 null */
+  /** 领这个产品需要的最低 LinuxDO 信任等级 */
+  min_trust_level: number
+  /** 接力产品的标准押金（分）；不是接力产品是 null */
+  deposit_base_cents: number | null
+  /** 分档押金：信任等级达到 level 时押金改成 cents */
+  deposit_tiers: DepositTier[]
+  /** 我领要付的押金（分）；null = 不用付 */
   deposit_cents: number | null
   /** 我已经付好、还没用的押金 */
   has_deposit: number
 }
+
+export type DepositTier = { level: number; cents: number }
 
 export type Totals = {
   available: number | null
@@ -179,6 +187,9 @@ export type AdminProduct = {
   share_reward_cents: number | null
   claim_reward_cents: number | null
   relay_required: number
+  deposit_cents: number | null
+  min_trust_level: number | null
+  deposit_tiers: DepositTier[]
   codes: number
   available: number
   claimed: number
@@ -195,6 +206,9 @@ export type ProductInput = {
   share_reward_cents?: number | null
   claim_reward_cents?: number | null
   relay_required?: boolean
+  deposit_cents?: number | null
+  min_trust_level?: number | null
+  deposit_tiers?: DepositTier[]
   active?: boolean
 }
 

@@ -262,6 +262,12 @@ type ProductForm = {
   share_reward: string
   claim_reward: string
   relay: boolean
+  /** 产品自己的押金 LDC，留空 = 全站押金 */
+  deposit: string
+  /** 最低领取信任等级，留空 = 全站 */
+  min_trust: string
+  /** 分档押金：信任等级达到 level，押金改成 amount LDC（0 = 免押金） */
+  tiers: { level: string; amount: string }[]
   locked: boolean
   /** 通过某条产品申请时才有 */
   request_id?: string
@@ -279,6 +285,9 @@ const EMPTY_FORM: ProductForm = {
   share_reward: '',
   claim_reward: '',
   relay: false,
+  deposit: '',
+  min_trust: '',
+  tiers: [],
   locked: false,
 }
 
@@ -341,6 +350,9 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
       share_reward: p.share_reward_cents === null ? '' : ldc(p.share_reward_cents),
       claim_reward: p.claim_reward_cents === null ? '' : ldc(p.claim_reward_cents),
       relay: !!p.relay_required,
+      deposit: p.deposit_cents === null ? '' : ldc(p.deposit_cents),
+      min_trust: p.min_trust_level === null ? '' : String(p.min_trust_level),
+      tiers: p.deposit_tiers.map((t) => ({ level: String(t.level), amount: ldc(t.cents) })),
       locked: p.codes > 0,
     })
 
@@ -353,6 +365,17 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
     const claim = reward(form.claim_reward)
     if (share === undefined || (form.share_reward.trim() && share === null)) return toast.error('贡献奖励金额不对')
     if (form.claim_reward.trim() && claim === null) return toast.error('领取奖励金额不对')
+    const deposit = form.deposit.trim() === '' ? null : parseLdc(form.deposit)
+    if (form.deposit.trim() && !deposit) return toast.error('押金要大于 0，最多两位小数')
+    const minTrust = form.min_trust.trim() === '' ? null : Number(form.min_trust)
+    if (minTrust !== null && (!Number.isInteger(minTrust) || minTrust < 0 || minTrust > 4)) {
+      return toast.error('最低等级要是 0 到 4')
+    }
+    const tiers = form.tiers.map((t) => ({ level: Number(t.level), cents: parseLdc(t.amount) }))
+    if (tiers.some((t) => !Number.isInteger(t.level) || t.level < 0 || t.level > 4 || t.cents === null)) {
+      return toast.error('分档押金：等级要是 0 到 4，押金不小于 0')
+    }
+    if (new Set(tiers.map((t) => t.level)).size !== tiers.length) return toast.error('分档押金的等级不能重复')
     const body = {
       name: form.name,
       mode: form.mode,
@@ -363,6 +386,9 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
       share_reward_cents: share,
       claim_reward_cents: claim,
       relay_required: form.relay,
+      deposit_cents: deposit,
+      min_trust_level: minTrust,
+      deposit_tiers: tiers as { level: number; cents: number }[],
     }
     setBusy(true)
     try {
@@ -535,7 +561,13 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
                       <div className="flex items-center gap-2 font-medium">
                         {p.name}
                         {p.active ? null : <Badge variant="secondary">已下架</Badge>}
-                        {p.relay_required ? <Badge variant="outline">接力</Badge> : null}
+                        {p.relay_required ? (
+                          <Badge variant="outline">
+                            接力{p.deposit_cents !== null ? ` · 押金 ${ldc(p.deposit_cents)}` : ''}
+                            {p.deposit_tiers.length ? ` · ${p.deposit_tiers.length} 档` : ''}
+                          </Badge>
+                        ) : null}
+                        {p.min_trust_level !== null ? <Badge variant="outline">≥{p.min_trust_level} 级</Badge> : null}
                       </div>
                       <span className="text-xs text-muted-foreground">{p.sharers} 位分享者</span>
                     </TableCell>
@@ -686,8 +718,88 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
                     </Button>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    需要接力时，领码前先付押金；领到的人放回自己的码、被别人领走后押金退回。押金金额和总开关在「接力押金」里设。
+                    需要接力时，领码前先付押金；领到的人放回自己的码、被别人领走后押金退回。总开关在「接力押金」里。
                   </p>
+                </div>
+                {form.relay ? (
+                  <div className="flex flex-col gap-3 rounded-lg border p-3">
+                    <div className="flex flex-col gap-2">
+                      <Label htmlFor="p-deposit">这个产品的押金 LDC</Label>
+                      <Input
+                        id="p-deposit"
+                        inputMode="decimal"
+                        placeholder="留空用全站押金"
+                        value={form.deposit}
+                        onChange={(e) => set({ deposit: e.target.value })}
+                      />
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      <Label>分档押金（可选）</Label>
+                      <p className="text-xs text-muted-foreground">
+                        信任等级达到某一档，押金改成这一档的金额；填 0 就是免押金。等级高的档优先。
+                      </p>
+                      {form.tiers.map((t, i) => (
+                        <div key={i} className="flex items-center gap-2">
+                          <Input
+                            aria-label="信任等级"
+                            type="number"
+                            min={0}
+                            max={4}
+                            className="w-20"
+                            value={t.level}
+                            onChange={(e) =>
+                              set({ tiers: form.tiers.map((x, j) => (j === i ? { ...x, level: e.target.value } : x)) })
+                            }
+                          />
+                          <span className="text-sm whitespace-nowrap text-muted-foreground">级及以上，押金</span>
+                          <Input
+                            aria-label="押金 LDC"
+                            inputMode="decimal"
+                            className="w-24"
+                            value={t.amount}
+                            onChange={(e) =>
+                              set({ tiers: form.tiers.map((x, j) => (j === i ? { ...x, amount: e.target.value } : x)) })
+                            }
+                          />
+                          <span className="text-sm text-muted-foreground">LDC</span>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => set({ tiers: form.tiers.filter((_, j) => j !== i) })}
+                          >
+                            删除
+                          </Button>
+                        </div>
+                      ))}
+                      {form.tiers.length < 5 ? (
+                        <div>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => set({ tiers: [...form.tiers, { level: '3', amount: '0' }] })}
+                          >
+                            <Plus />
+                            加一档
+                          </Button>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="p-trust">最低领取等级（可选）</Label>
+                  <Input
+                    id="p-trust"
+                    type="number"
+                    min={0}
+                    max={4}
+                    placeholder="留空用全站设置"
+                    value={form.min_trust}
+                    onChange={(e) => set({ min_trust: e.target.value })}
+                  />
+                  <p className="text-xs text-muted-foreground">LinuxDO 信任等级 0 到 4，低于这个等级的人看得到这个产品但领不了。</p>
                 </div>
                 {form.request_id ? (
                   <div className="flex flex-col gap-2">
@@ -1354,8 +1466,8 @@ function RelayPanel({ version, onChanged }: { version: number; onChanged: () => 
               <div className="max-w-xs">
                 <Field
                   id="r-amount"
-                  label="押金（LDC）"
-                  hint="每领一个接力产品收一次"
+                  label="默认押金（LDC）"
+                  hint="产品没单独设押金时用这个；产品里还可以按信任等级分档减免"
                   value={amount}
                   onChange={setAmount}
                 />

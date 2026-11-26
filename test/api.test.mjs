@@ -902,6 +902,65 @@ try {
     assert.equal((await r4.json('/api/my/deposits')).data.deposits[0].status, 'refunded')
     ok('管理员能看所有押金、手动退回或没收')
 
+    // 每个产品自己的押金、最低等级、分档押金
+    const mkp = (b) => boss.json('/api/admin/products', 'POST', b)
+    assert.equal((await mkp({ name: 'Bad1', relay_required: true, deposit_cents: 0 })).data.error, 'bad_deposit')
+    assert.equal((await mkp({ name: 'Bad2', min_trust_level: 5 })).data.error, 'bad_trust_level')
+    assert.equal((await mkp({ name: 'Bad3', deposit_tiers: [{ level: 3, cents: 1 }, { level: 3, cents: 0 }] })).data.error, 'bad_tiers')
+    const tiered = await mkp({
+      name: 'Tiered',
+      relay_required: true,
+      deposit_cents: 800,
+      min_trust_level: 2,
+      deposit_tiers: [{ level: 4, cents: 0 }, { level: 3, cents: 400 }],
+    })
+    assert.equal(tiered.status, 200, JSON.stringify(tiered.data))
+    const tk = tiered.data.key
+    const ap = (await boss.json('/api/admin/products')).data.products.find((p) => p.key === tk)
+    assert.equal(ap.deposit_cents, 800)
+    assert.equal(ap.min_trust_level, 2)
+    assert.deepEqual(ap.deposit_tiers, [{ level: 3, cents: 400 }, { level: 4, cents: 0 }])
+    const tsh = await new Client().devLogin('tier-sharer', 2)
+    assert.equal((await tsh.json('/api/codes', 'POST', { product_key: tk, codes: 'TIER-A\nTIER-B\nTIER-C' })).status, 200)
+    const t1 = await new Client().devLogin('tier1', 1)
+    const t2 = await new Client().devLogin('tier2', 2)
+    const t3 = await new Client().devLogin('tier3', 3)
+    const t4 = await new Client().devLogin('tier4', 4)
+    const view = async (cl) => (await cl.json('/api/products')).data.products.find((p) => p.key === tk)
+    const v1 = await view(t1)
+    assert.equal(v1.min_trust_level, 2)
+    assert.equal(v1.deposit_base_cents, 800)
+    assert.equal((await t1.json('/api/claim', 'POST', { product_key: tk })).data.error, 'trust_level')
+    assert.equal((await t1.json(`/api/products/${tk}/deposit`, 'POST')).data.error, 'trust_level')
+    assert.equal((await view(t2)).deposit_cents, 800)
+    assert.equal((await view(t3)).deposit_cents, 400)
+    assert.equal((await view(t4)).deposit_cents, null)
+    assert.equal((await view(new Client())).deposit_cents, 800)
+    ok('产品单独的最低等级：等级不够不能领也不能付押金')
+
+    assert.equal((await t2.json('/api/claim', 'POST', { product_key: tk })).data.error, 'deposit_required')
+    const r2pay = await t2.json(`/api/products/${tk}/deposit`, 'POST')
+    assert.equal(new URL(r2pay.data.url).searchParams.get('money'), '8.00')
+    const r3pay = await t3.json(`/api/products/${tk}/deposit`, 'POST')
+    const q3 = Object.fromEntries(new URL(r3pay.data.url).searchParams)
+    assert.equal(q3.money, '4.00')
+    await notify(q3)
+    assert.equal((await t3.json('/api/claim', 'POST', { product_key: tk })).data.claim.deposit_cents, 400)
+    assert.equal((await t4.json(`/api/products/${tk}/deposit`, 'POST')).data.error, 'no_deposit_needed')
+    const c4t = await t4.json('/api/claim', 'POST', { product_key: tk })
+    assert.equal(c4t.status, 200)
+    assert.equal(c4t.data.claim.deposit_cents, null)
+    ok('分档押金：产品自己的押金 8，3 级减到 4，4 级免押金直接领')
+
+    // 产品的最低等级可以比全站低
+    const open = await mkp({ name: 'OpenLow', min_trust_level: 0 })
+    await tsh.json('/api/codes', 'POST', { product_key: open.data.key, codes: 'OPEN-1' })
+    assert.equal((await newbie.json('/api/claim', 'POST', { product_key: open.data.key })).status, 200)
+    assert.equal((await newbie.json('/api/claim', 'POST', { product_key: tk })).data.error, 'trust_level')
+    assert.equal((await boss.json(`/api/admin/products/${tk}`, 'PATCH', { deposit_tiers: [], deposit_cents: null })).status, 200)
+    assert.equal((await view(t4)).deposit_cents, 300)
+    ok('产品最低等级可以低于全站；清掉分档和产品押金后回到全站押金')
+
     await boss.json('/api/admin/settings', 'PUT', { relay_enabled: false, hold_hours: 24 })
     const off = (await r1.json('/api/products')).data.products.find((p) => p.key === key)
     assert.equal(off.deposit_cents, null)

@@ -69,6 +69,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
   }, [products, query])
 
   const lowTrust = !!user && !!limits && user.trust_level < limits.minTrustLevel
+  const tooLow = (p: Product) => !!user && user.trust_level < p.min_trust_level
 
   const doClaim = async (p: Product) => {
     setClaiming(p.key)
@@ -136,9 +137,9 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
 
       {lowTrust ? (
         <Alert>
-          <AlertTitle>你的 LinuxDO 信任等级还不够领码</AlertTitle>
+          <AlertTitle>你的 LinuxDO 信任等级还不够领大部分产品</AlertTitle>
           <AlertDescription>
-            需要达到 {limits?.minTrustLevel} 级，你现在是 {user?.trust_level} 级。可以先分享自己多余的码。
+            你现在是 {user?.trust_level} 级，大部分产品需要 {limits?.minTrustLevel} 级，每个产品的要求写在卡片上。可以先分享自己多余的码。
           </AlertDescription>
         </Alert>
       ) : null}
@@ -205,6 +206,9 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
                     <Badge variant="outline">
                       {p.mode === 'multi' ? `每人一个码 · 每码 ${p.max_uses} 人可用` : '一次性码'}
                     </Badge>
+                    {p.min_trust_level > 0 ? (
+                      <Badge variant={tooLow(p) ? 'destructive' : 'outline'}>需 {p.min_trust_level} 级</Badge>
+                    ) : null}
                     {p.mode === 'multi' && p.available_codes > 0 ? (
                       <span>{p.available_codes} 位分享者轮流发</span>
                     ) : null}
@@ -225,7 +229,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
                   <ClaimButton
                     product={p}
                     user={user}
-                    lowTrust={lowTrust}
+                    lowTrust={tooLow(p)}
                     loading={claiming === p.key}
                     onClaim={() => doClaim(p)}
                     onDeposit={() => setDepositFor(p)}
@@ -346,13 +350,21 @@ function RewardLine({ product: p }: { product: Product }) {
 }
 
 function RelayLine({ product: p }: { product: Product }) {
-  if (!p.deposit_cents) return null
+  if (p.deposit_base_cents === null) return null
+  const tiers = p.deposit_tiers
+    .map((t) => `${t.level} 级${t.cents ? ` ${ldc(t.cents)}` : '免押金'}`)
+    .join('，')
+  const mine = p.has_deposit
+    ? '你的押金已付，可以领了'
+    : p.deposit_cents === null
+      ? '你的等级够了，免押金'
+      : `你领要付 ${ldc(p.deposit_cents)} LDC，放回你的码被领走后退回`
   return (
-    <span className="flex items-center gap-1 text-foreground">
-      <Repeat className="size-4" />
-      {p.has_deposit
-        ? `接力产品：押金 ${ldc(p.deposit_cents)} LDC 已付，可以领了`
-        : `接力产品：领前付 ${ldc(p.deposit_cents)} LDC 押金，放回你的码被领走后退回`}
+    <span className="flex items-start gap-1 text-foreground">
+      <Repeat className="mt-0.5 size-4 shrink-0" />
+      <span>
+        接力产品：押金 {ldc(p.deposit_base_cents)} LDC{tiers ? `（${tiers}）` : ''}。{mine}
+      </span>
     </span>
   )
 }
@@ -402,6 +414,13 @@ function ClaimButton({
     return (
       <Button variant="secondary" className="w-full" disabled>
         {product.available > 0 ? '只剩你自己的码' : '暂无可领'}
+      </Button>
+    )
+  }
+  if (lowTrust) {
+    return (
+      <Button variant="secondary" className="w-full" disabled>
+        需要 {product.min_trust_level} 级才能领
       </Button>
     )
   }

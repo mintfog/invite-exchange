@@ -372,6 +372,62 @@ type ProductRow = {
   share_reward_cents: number | null
   claim_reward_cents: number | null
   relay_required: number
+  /** 这个产品自己的押金（分）；null = 用全站押金 */
+  deposit_cents: number | null
+  /** 这个产品的最低领取信任等级；null = 用全站的 MIN_TRUST_LEVEL */
+  min_trust_level: number | null
+  /** 分档押金 JSON：[{"level":3,"cents":0}]，信任等级达到 level 时押金改成 cents */
+  deposit_tiers: string | null
+}
+
+type DepositTier = { level: number; cents: number }
+
+// 分档押金：每档是「信任等级达到 level，押金改成 cents（0 = 免押金）」。返回 undefined 表示格式不对。
+function parseTiers(v: unknown): DepositTier[] | undefined {
+  if (v === null || v === undefined || v === '') return []
+  let arr = v
+  if (typeof v === 'string') {
+    try {
+      arr = JSON.parse(v)
+    } catch {
+      return undefined
+    }
+  }
+  if (!Array.isArray(arr) || arr.length > 5) return undefined
+  const out: DepositTier[] = []
+  for (const t of arr) {
+    const level = intIn((t as DepositTier)?.level, 0, 4)
+    const cents = intIn((t as DepositTier)?.cents, 0, LIMITS.rewardCents)
+    if (level === null || cents === null || out.some((x) => x.level === level)) return undefined
+    out.push({ level, cents })
+  }
+  return out.sort((a, b) => a.level - b.level)
+}
+
+type ProductRules = Pick<ProductRow, 'relay_required' | 'deposit_cents' | 'min_trust_level' | 'deposit_tiers'>
+
+// 一个产品对某个信任等级的人的规则：最低等级、押金（null = 不用押金）
+function rulesFor(p: ProductRules, s: Settings, env: Env, trustLevel: number | null) {
+  const minTrust = p.min_trust_level ?? num(env.MIN_TRUST_LEVEL, 1)
+  const tiers = parseTiers(p.deposit_tiers) ?? []
+  if (!s.relay_enabled || !p.relay_required) return { minTrust, base: null, tiers, deposit: null }
+  const base = p.deposit_cents ?? s.relay_deposit_cents
+  let deposit = base
+  if (trustLevel !== null) {
+    for (const t of tiers) if (trustLevel >= t.level) deposit = t.cents
+  }
+  return { minTrust, base, tiers, deposit: deposit > 0 ? deposit : null }
+}
+
+async function productRules(env: Env, key: string, trustLevel: number) {
+  const p = await env.DB.prepare(
+    'SELECT relay_required, deposit_cents, min_trust_level, deposit_tiers FROM products WHERE key = ?',
+  )
+    .bind(key)
+    .first<ProductRules>()
+  const s = await getSettings(env.DB)
+  if (!p) return { minTrust: num(env.MIN_TRUST_LEVEL, 1), base: null, tiers: [], deposit: null }
+  return rulesFor(p, s, env, trustLevel)
 }
 
 function intIn(v: unknown, min: number, max: number) {
@@ -399,6 +455,9 @@ type ProductInput = {
   share_reward_cents?: unknown
   claim_reward_cents?: unknown
   relay_required?: unknown
+  deposit_cents?: unknown
+  min_trust_level?: unknown
+  deposit_tiers?: unknown
   /** 只在通过产品申请时用：给申请人的备注 */
   admin_note?: unknown
 }
@@ -443,6 +502,17 @@ function checkProduct(b: ProductInput):
   if (share === undefined || claim === undefined) {
     return { error: 'bad_reward', message: '奖励金额需要 0 到 10000 LDC，最多两位小数，或者留空跟随全站设置' }
   }
+  const empty = (v: unknown) => v === null || v === undefined || v === ''
+  const deposit = empty(b.deposit_cents) ? null : intIn(b.deposit_cents, 1, LIMITS.rewardCents)
+  if (deposit === null && !empty(b.deposit_cents)) {
+    return { error: 'bad_deposit', message: '押金需要大于 0、最多两位小数，或者留空跟随全站押金' }
+  }
+  const minTrust = empty(b.min_trust_level) ? null : intIn(b.min_trust_level, 0, 4)
+  if (minTrust === null && !empty(b.min_trust_level)) {
+    return { error: 'bad_trust_level', message: '最低等级需要是 0 到 4，或者留空跟随全站设置' }
+  }
+  const tiers = parseTiers(b.deposit_tiers)
+  if (!tiers) return { error: 'bad_tiers', message: '分档押金最多 5 档，每档等级 0 到 4 不能重复，押金不小于 0' }
 
   return {
     value: {
@@ -455,6 +525,9 @@ function checkProduct(b: ProductInput):
       share_reward_cents: share,
       claim_reward_cents: claim,
       relay_required: b.relay_required === true || b.relay_required === 1 || b.relay_required === '1' ? 1 : 0,
+      deposit_cents: deposit,
+      min_trust_level: minTrust,
+      deposit_tiers: tiers.length ? JSON.stringify(tiers) : null,
     },
   }
 }
@@ -469,6 +542,7 @@ app.get('/products', async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT p.key, p.name, p.mode, p.max_uses, p.max_codes_per_user, p.description,
             p.share_reward_cents, p.claim_reward_cents, p.relay_required,
+            p.deposit_cents AS own_deposit_cents, p.min_trust_level AS own_min_trust, p.deposit_tiers,
             EXISTS (SELECT 1 FROM relay_deposits d
                      WHERE d.user_id = ?1 AND d.product_key = p.key AND d.status = 'paid') AS has_deposit,
             p.code_pattern IS NOT NULL AS has_pattern,
@@ -489,16 +563,35 @@ app.get('/products', async (c) => {
       LIMIT 200`,
   )
     .bind(user?.id ?? -1)
-    .all<{ share_reward_cents: number | null; claim_reward_cents: number | null; relay_required: number }>()
+    .all<{
+      share_reward_cents: number | null
+      claim_reward_cents: number | null
+      relay_required: number
+      own_deposit_cents: number | null
+      own_min_trust: number | null
+      deposit_tiers: string | null
+    }>()
   const settings = await getSettings(c.env.DB)
   const on = settings.ldc_enabled && ldcConfigured(c.env)
-  const products = results.map(({ relay_required, ...p }) => ({
-    ...p,
-    share_reward_cents: on ? (p.share_reward_cents ?? settings.share_reward_cents) : 0,
-    claim_reward_cents: on ? (p.claim_reward_cents ?? settings.claim_reward_cents) : 0,
-    // 要接力的产品：领之前要付的押金（分）；不需要接力是 null
-    deposit_cents: settings.relay_enabled && relay_required ? settings.relay_deposit_cents : null,
-  }))
+  const products = results.map(({ relay_required, own_deposit_cents, own_min_trust, deposit_tiers, ...p }) => {
+    const r = rulesFor(
+      { relay_required, deposit_cents: own_deposit_cents, min_trust_level: own_min_trust, deposit_tiers },
+      settings,
+      c.env,
+      user?.trust_level ?? null,
+    )
+    return {
+      ...p,
+      share_reward_cents: on ? (p.share_reward_cents ?? settings.share_reward_cents) : 0,
+      claim_reward_cents: on ? (p.claim_reward_cents ?? settings.claim_reward_cents) : 0,
+      min_trust_level: r.minTrust,
+      // 接力产品：标准押金（分）和分档；不需要接力是 null / []
+      deposit_base_cents: r.base,
+      deposit_tiers: r.base === null ? [] : r.tiers,
+      // 这个人领要付的押金：null = 不用付（不是接力产品，或等级够了免押金）
+      deposit_cents: user ? r.deposit : r.base,
+    }
+  })
   const totals = await c.env.DB.prepare(
     `SELECT (SELECT COALESCE(SUM(${REMAINING}), 0) FROM codes c JOIN products p ON p.key = c.product_key
               WHERE c.status = 'available' AND p.active = 1) AS available,
@@ -783,13 +876,6 @@ export async function runPayouts(env: Env, limit = 25, only?: string[]) {
 
 // ---------- 接力押金 ----------
 
-async function relayDeposit(db: D1Database, productKey: string) {
-  const s = await getSettings(db)
-  if (!s.relay_enabled) return null
-  const p = await db.prepare('SELECT relay_required FROM products WHERE key = ?').bind(productKey).first<{ relay_required: number }>()
-  return p?.relay_required ? s.relay_deposit_cents : null
-}
-
 async function md5Hex(s: string) {
   const buf = await crypto.subtle.digest('MD5', new TextEncoder().encode(s))
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
@@ -886,17 +972,17 @@ export async function runRefunds(env: Env, limit = 25) {
 app.post('/products/:key/deposit', async (c) => {
   const user = requireUser(c)
   if (!user) return fail(c, 401, 'login_required', '请先登录')
-  const minTrust = num(c.env.MIN_TRUST_LEVEL, 1)
-  if (user.trust_level < minTrust) {
-    return fail(c, 403, 'trust_level', `LinuxDO 信任等级达到 ${minTrust} 级才能领码`)
-  }
   const key = c.req.param('key')
   const product = await c.env.DB.prepare('SELECT name FROM products WHERE key = ? AND active = 1')
     .bind(key)
     .first<{ name: string }>()
   if (!product) return fail(c, 404, 'no_product', '这个产品不存在或已下架')
-  const amount = await relayDeposit(c.env.DB, key)
-  if (!amount) return fail(c, 409, 'no_deposit_needed', `领 ${product.name} 不用押金`)
+  const rules = await productRules(c.env, key, user.trust_level)
+  if (user.trust_level < rules.minTrust) {
+    return fail(c, 403, 'trust_level', `LinuxDO 信任等级达到 ${rules.minTrust} 级才能领 ${product.name}`)
+  }
+  const amount = rules.deposit
+  if (!amount) return fail(c, 409, 'no_deposit_needed', `你领 ${product.name} 不用押金`)
   if (!ldcConfigured(c.env)) return fail(c, 409, 'ldc_not_configured', '站点还没接上 LINUX DO Credit，暂时付不了押金')
   const db = c.env.DB
   if (await db.prepare('SELECT 1 FROM claims WHERE user_id = ? AND product_key = ? AND void_at IS NULL').bind(user.id, key).first()) {
@@ -1006,19 +1092,19 @@ app.post('/deposits/:id/refund', async (c) => {
 app.post('/claim', async (c) => {
   const user = requireUser(c)
   if (!user) return fail(c, 401, 'login_required', '请先登录')
-  const minTrust = num(c.env.MIN_TRUST_LEVEL, 1)
-  if (user.trust_level < minTrust) {
-    return fail(c, 403, 'trust_level', `LinuxDO 信任等级达到 ${minTrust} 级才能领码`)
-  }
   const body = await c.req.json<{ product_key?: string }>().catch(() => null)
   const key = body?.product_key ?? ''
   if (!key) return fail(c, 400, 'bad_product', '缺少产品')
+  const rules = await productRules(c.env, key, user.trust_level)
+  if (user.trust_level < rules.minTrust) {
+    return fail(c, 403, 'trust_level', `LinuxDO 信任等级达到 ${rules.minTrust} 级才能领这个产品`)
+  }
 
   const t = now()
   const maxClaims = num(c.env.MAX_CLAIMS_PER_DAY, 5)
 
   // 要接力的产品：先付押金
-  const depositCents = await relayDeposit(c.env.DB, key)
+  const depositCents = rules.deposit
   let deposit: { id: string } | null = null
   if (depositCents) {
     const claimed = await c.env.DB.prepare(
@@ -1322,6 +1408,7 @@ admin.get('/products', async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT p.key, p.name, p.mode, p.max_uses, p.max_codes_per_user, p.code_pattern, p.description,
             p.active, p.created_at, p.share_reward_cents, p.claim_reward_cents, p.relay_required,
+            p.deposit_cents, p.min_trust_level, p.deposit_tiers,
             (SELECT COUNT(*) FROM codes c WHERE c.product_key = p.key AND c.status <> 'withdrawn') AS codes,
             (SELECT COALESCE(SUM(${REMAINING}), 0) FROM codes c
               WHERE c.product_key = p.key AND c.status = 'available') AS available,
@@ -1330,8 +1417,8 @@ admin.get('/products', async (c) => {
               WHERE c.product_key = p.key AND c.status <> 'withdrawn') AS sharers
        FROM products p
       ORDER BY p.active DESC, p.created_at DESC`,
-  ).all()
-  return c.json({ products: results })
+  ).all<{ deposit_tiers: string | null }>()
+  return c.json({ products: results.map((p) => ({ ...p, deposit_tiers: parseTiers(p.deposit_tiers) ?? [] })) })
 })
 
 admin.post('/products', async (c) => {
@@ -1344,8 +1431,8 @@ admin.post('/products', async (c) => {
   const r = await c.env.DB.prepare(
     `INSERT OR IGNORE INTO products
        (key, name, created_by, created_at, updated_at, mode, max_uses, max_codes_per_user, code_pattern, description,
-        share_reward_cents, claim_reward_cents, relay_required, active)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+        share_reward_cents, claim_reward_cents, relay_required, deposit_cents, min_trust_level, deposit_tiers, active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
   )
     .bind(
       key,
@@ -1361,6 +1448,9 @@ admin.post('/products', async (c) => {
       v.share_reward_cents,
       v.claim_reward_cents,
       v.relay_required,
+      v.deposit_cents,
+      v.min_trust_level,
+      v.deposit_tiers,
     )
     .run()
   if (!r.meta.changes) return fail(c, 409, 'exists', `已经有 ${v.name} 这个产品了`)
@@ -1387,8 +1477,8 @@ admin.patch('/products/:key', async (c) => {
   const active = body.active === undefined ? cur.active : body.active ? 1 : 0
   await c.env.DB.prepare(
     `UPDATE products SET name = ?, mode = ?, max_uses = ?, max_codes_per_user = ?, code_pattern = ?,
-            description = ?, share_reward_cents = ?, claim_reward_cents = ?, relay_required = ?, active = ?,
-            updated_at = ?
+            description = ?, share_reward_cents = ?, claim_reward_cents = ?, relay_required = ?, deposit_cents = ?,
+            min_trust_level = ?, deposit_tiers = ?, active = ?, updated_at = ?
       WHERE key = ?`,
   )
     .bind(
@@ -1401,6 +1491,9 @@ admin.patch('/products/:key', async (c) => {
       v.share_reward_cents,
       v.claim_reward_cents,
       v.relay_required,
+      v.deposit_cents,
+      v.min_trust_level,
+      v.deposit_tiers,
       active,
       now(),
       key,
@@ -1767,8 +1860,8 @@ admin.post('/product-requests/:id/approve', async (c) => {
     : c.env.DB.prepare(
         `INSERT INTO products
            (key, name, created_by, created_at, updated_at, mode, max_uses, max_codes_per_user, code_pattern, description,
-            share_reward_cents, claim_reward_cents, relay_required, active)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+            share_reward_cents, claim_reward_cents, relay_required, deposit_cents, min_trust_level, deposit_tiers, active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
       ).bind(
         key,
         v.name,
@@ -1783,6 +1876,9 @@ admin.post('/product-requests/:id/approve', async (c) => {
         v.share_reward_cents,
         v.claim_reward_cents,
         v.relay_required,
+        v.deposit_cents,
+        v.min_trust_level,
+        v.deposit_tiers,
       )
   const note = typeof body.admin_note === 'string' ? body.admin_note.trim().slice(0, LIMITS.adminNote) || null : null
   await c.env.DB.batch([
