@@ -14,7 +14,7 @@
     {
       "binding": "DB",
       "database_name": "invite-exchange",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "database_id": "5ed14614-5fbb-4aae-bd96-8cbedface41e",
       "migrations_dir": "migrations"
     }
   ],
