@@ -213,6 +213,38 @@ export type AdminPayout = {
   sharer_avatar: string | null
 }
 
+export type RequestStatus = 'pending' | 'approved' | 'rejected' | 'canceled'
+
+export type ProductRequest = {
+  id: string
+  name: string
+  product_key: string
+  mode: Mode
+  max_uses: number | null
+  description: string | null
+  status: RequestStatus
+  admin_note: string | null
+  created_at: number
+  resolved_at: number | null
+}
+
+export type AdminProductRequest = ProductRequest & {
+  username: string
+  avatar_url: string | null
+  resolved_by_username: string | null
+  existing_product: string | null
+  existing_active: number | null
+}
+
+export type NewProductRequest = { name: string; mode: Mode; max_uses?: number; description?: string }
+
+export const REQUEST_STATUS: Record<RequestStatus, string> = {
+  pending: '待审核',
+  approved: '已通过',
+  rejected: '没通过',
+  canceled: '已撤回',
+}
+
 export type RunResult = { configured: boolean; enabled: boolean; sent: number; failed: number; waiting: number }
 
 export class ApiError extends Error {
@@ -257,6 +289,9 @@ export const api = {
   myShared: () =>
     request<{ codes: SharedCode[]; claimers: Claimer[]; summary: SharedSummary; payouts: MyPayout[] }>('/my/shared'),
   myClaimed: () => request<{ claims: Claim[] }>('/my/claimed'),
+  requestProduct: (b: NewProductRequest) => post<{ id: string }>('/product-requests', b),
+  myRequests: () => request<{ requests: ProductRequest[] }>('/my/product-requests'),
+  cancelRequest: (id: string) => post<{ ok: true }>(`/product-requests/${id}`, undefined, 'DELETE'),
 
   admin: {
     products: () => request<{ products: AdminProduct[] }>('/admin/products'),
@@ -269,6 +304,12 @@ export const api = {
       ),
     removeCode: (id: string) => post<{ ok: true }>(`/admin/codes/${id}`, undefined, 'DELETE'),
     users: () => request<{ users: AdminUser[] }>('/admin/users'),
+    productRequests: (status = 'pending') =>
+      request<{ requests: AdminProductRequest[] }>(`/admin/product-requests?status=${status}`),
+    approveRequest: (id: string, b: ProductInput & { admin_note?: string | null }) =>
+      post<{ key: string; reactivated: boolean }>(`/admin/product-requests/${id}/approve`, b),
+    rejectRequest: (id: string, note: string) =>
+      post<{ ok: true }>(`/admin/product-requests/${id}/reject`, { note }),
     reports: (status = 'open') => request<{ reports: Report[] }>(`/admin/reports?status=${status}`),
     resolveReport: (id: string, action: 'confirm' | 'dismiss') =>
       post<{ ok: true }>(`/admin/reports/${id}/resolve`, { action }),

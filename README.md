@@ -7,6 +7,7 @@
 - **随机轮流发**：领取时优先发给被领得最少的分享者，同样少的随机挑，每个分享者都能被用到。
 - **LDC 奖励**：通过 LINUX DO Credit 从站长的商户账户给分享者发 LDC。贡献奖励（每个码首次被领）和领取奖励（每被领一次）可在管理页设置，单个产品可覆盖；领取后先过观察期，没人反馈无效才发；全站 24 小时有上限。
 - **无效反馈**：领取人可以反馈码用不了，管理员确认后撤下码、取消奖励，反馈人可以再领一个。
+- **申请新产品**：普通用户可以申请广场上还没有的产品（每人同时最多 3 条待审核），管理员在「管理 → 产品」里通过（可改设置，通过后直接上架）或拒绝并说明理由。
 
 - 前端：React + Vite + shadcn/ui 官方组件（黑白灰 neutral 主题）
 - 后端：Cloudflare Worker（Hono），和前端在同一个 Worker 里，`/api/*` 走接口，其他走静态页面
@@ -130,6 +131,9 @@ npm test   # 自动起本地 wrangler dev、跑 test/api.test.mjs，跑完关掉
 | POST | `/api/claim` | 领一个 `{product_key}` |
 | POST | `/api/claims/:id/thanks` | 感谢分享者 |
 | POST | `/api/claims/:id/report` | 反馈码无效 `{reason}` |
+| POST | `/api/product-requests` | 申请新产品 `{name, mode, max_uses?, description?}` |
+| GET | `/api/my/product-requests` | 我的产品申请 |
+| DELETE | `/api/product-requests/:id` | 撤回待审核的申请 |
 | GET | `/api/my/shared` | 我分享的（含用的人、剩余次数、LDC 奖励） |
 | GET | `/api/my/claimed` | 我领到的 |
-| * | `/api/admin/*` | 管理员：产品、所有码、用户、无效反馈、LDC 设置和发放记录 |
+| * | `/api/admin/*` | 管理员：产品、产品申请、所有码、用户、无效反馈、LDC 设置和发放记录 |

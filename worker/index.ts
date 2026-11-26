@@ -48,6 +48,9 @@ const LIMITS = {
   pattern: 200,
   maxUses: 1000,
   reason: 200,
+  /** 每人同时最多几条待审核的产品申请 */
+  pendingRequests: 3,
+  adminNote: 200,
   /** 单笔奖励上限：10000 LDC（单位：分） */
   rewardCents: 1_000_000,
 }
@@ -388,6 +391,8 @@ type ProductInput = {
   active?: unknown
   share_reward_cents?: unknown
   claim_reward_cents?: unknown
+  /** 只在通过产品申请时用：给申请人的备注 */
+  admin_note?: unknown
 }
 
 // 校验管理员填的产品设置。返回错误信息，或者规范化后的值。
@@ -851,6 +856,81 @@ app.post('/claims/:id/report', async (c) => {
   return c.json({ ok: true })
 })
 
+// ---------- 申请新产品 ----------
+
+const REQUEST_COLUMNS = `r.id, r.name, r.product_key, r.mode, r.max_uses, r.description, r.status, r.admin_note,
+            r.created_at, r.resolved_at`
+
+app.post('/product-requests', async (c) => {
+  const user = requireUser(c)
+  if (!user) return fail(c, 401, 'login_required', '请先登录')
+  const body = await c.req
+    .json<{ name?: unknown; mode?: unknown; max_uses?: unknown; description?: unknown }>()
+    .catch(() => null)
+  const name = typeof body?.name === 'string' ? body.name.normalize('NFKC').trim().replace(/\s+/g, ' ') : ''
+  if (!name || name.length > LIMITS.productName) {
+    return fail(c, 400, 'bad_name', `产品名需要 1 到 ${LIMITS.productName} 个字`)
+  }
+  const mode = body?.mode === 'multi' ? 'multi' : 'single'
+  let maxUses: number | null = null
+  if (mode === 'multi' && body?.max_uses !== undefined && body?.max_uses !== null && body?.max_uses !== '') {
+    maxUses = intIn(body.max_uses, 1, LIMITS.maxUses)
+    if (maxUses === null) return fail(c, 400, 'bad_max_uses', `每个码可用次数需要 1 到 ${LIMITS.maxUses}`)
+  }
+  const description =
+    typeof body?.description === 'string' && body.description.trim()
+      ? body.description.trim().slice(0, LIMITS.description)
+      : null
+  const key = productKey(name)
+
+  const existing = await c.env.DB.prepare('SELECT name, active FROM products WHERE key = ?')
+    .bind(key)
+    .first<{ name: string; active: number }>()
+  if (existing?.active) return fail(c, 409, 'exists', `广场上已经有 ${existing.name} 了，直接去分享吧`)
+
+  const mine = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM product_requests WHERE user_id = ? AND status = 'pending'",
+  )
+    .bind(user.id)
+    .first<{ n: number }>()
+  if ((mine?.n ?? 0) >= LIMITS.pendingRequests) {
+    return fail(c, 429, 'too_many_requests', `你已经有 ${LIMITS.pendingRequests} 个申请在等审核，等管理员处理后再申请`)
+  }
+
+  const id = crypto.randomUUID()
+  const r = await c.env.DB.prepare(
+    `INSERT OR IGNORE INTO product_requests (id, user_id, name, product_key, mode, max_uses, description, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+  )
+    .bind(id, user.id, name, key, mode, maxUses, description, now())
+    .run()
+  if (!r.meta.changes) return fail(c, 409, 'already_requested', `已经有人申请了 ${name}，正在等管理员审核`)
+  return c.json({ id })
+})
+
+app.get('/my/product-requests', async (c) => {
+  const user = requireUser(c)
+  if (!user) return fail(c, 401, 'login_required', '请先登录')
+  const { results } = await c.env.DB.prepare(
+    `SELECT ${REQUEST_COLUMNS} FROM product_requests r WHERE r.user_id = ? ORDER BY r.created_at DESC LIMIT 100`,
+  )
+    .bind(user.id)
+    .all()
+  return c.json({ requests: results })
+})
+
+app.delete('/product-requests/:id', async (c) => {
+  const user = requireUser(c)
+  if (!user) return fail(c, 401, 'login_required', '请先登录')
+  const r = await c.env.DB.prepare(
+    "UPDATE product_requests SET status = 'canceled', resolved_at = ? WHERE id = ? AND user_id = ? AND status = 'pending'",
+  )
+    .bind(now(), c.req.param('id'), user.id)
+    .run()
+  if (!r.meta.changes) return fail(c, 404, 'not_found', '没有这条待审核的申请')
+  return c.json({ ok: true })
+})
+
 // ---------- 我的 ----------
 
 const CODE_COLUMNS = `c.id, c.product_key, p.name AS product, p.mode, c.code, c.note, c.status, c.created_at,
@@ -1252,6 +1332,105 @@ admin.get('/users', async (c) => {
       is_test: u.linuxdo_id < 0,
     })),
   })
+})
+
+type RequestRow = {
+  id: string
+  user_id: number
+  name: string
+  product_key: string
+  mode: 'single' | 'multi'
+  max_uses: number | null
+  description: string | null
+  status: string
+}
+
+admin.get('/product-requests', async (c) => {
+  const status = c.req.query('status') ?? 'pending'
+  const { results } = await c.env.DB.prepare(
+    `SELECT ${REQUEST_COLUMNS}, u.username, u.avatar_url, ru.username AS resolved_by_username,
+            (SELECT name FROM products p WHERE p.key = r.product_key) AS existing_product,
+            (SELECT active FROM products p WHERE p.key = r.product_key) AS existing_active
+       FROM product_requests r
+       JOIN users u ON u.id = r.user_id
+       LEFT JOIN users ru ON ru.id = r.resolved_by
+      WHERE ?1 = 'all' OR r.status = ?1
+      ORDER BY r.created_at DESC
+      LIMIT 500`,
+  )
+    .bind(status)
+    .all()
+  return c.json({ requests: results })
+})
+
+// 通过：用管理员填的产品设置（没填的用申请里的）建产品；产品已存在但下架了就重新上架
+admin.post('/product-requests/:id/approve', async (c) => {
+  const req = await c.env.DB.prepare("SELECT * FROM product_requests WHERE id = ? AND status = 'pending'")
+    .bind(c.req.param('id'))
+    .first<RequestRow>()
+  if (!req) return fail(c, 404, 'not_found', '没有这条待审核的申请')
+  const body = await c.req.json<ProductInput>().catch(() => ({}) as ProductInput)
+  const input: ProductInput = {
+    name: req.name,
+    mode: req.mode,
+    max_uses: req.max_uses ?? (req.mode === 'multi' ? 30 : undefined),
+    description: req.description,
+    ...body,
+  }
+  const checked = checkProduct(input)
+  if ('error' in checked) return fail(c, 400, checked.error, checked.message)
+  const v = checked.value
+  const key = productKey(v.name)
+  const t = now()
+  const adminId = c.get('user')!.id
+
+  const existing = await c.env.DB.prepare('SELECT active FROM products WHERE key = ?').bind(key).first<{ active: number }>()
+  if (existing?.active) {
+    return fail(c, 409, 'exists', `已经有 ${v.name} 这个产品了，可以拒绝这条申请并说明`)
+  }
+  const createOrReactivate = existing
+    ? c.env.DB.prepare('UPDATE products SET active = 1, updated_at = ? WHERE key = ?').bind(t, key)
+    : c.env.DB.prepare(
+        `INSERT INTO products
+           (key, name, created_by, created_at, updated_at, mode, max_uses, max_codes_per_user, code_pattern, description,
+            share_reward_cents, claim_reward_cents, active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+      ).bind(
+        key,
+        v.name,
+        adminId,
+        t,
+        t,
+        v.mode,
+        v.max_uses,
+        v.max_codes_per_user,
+        v.code_pattern,
+        v.description,
+        v.share_reward_cents,
+        v.claim_reward_cents,
+      )
+  const note = typeof body.admin_note === 'string' ? body.admin_note.trim().slice(0, LIMITS.adminNote) || null : null
+  await c.env.DB.batch([
+    createOrReactivate,
+    c.env.DB.prepare(
+      `UPDATE product_requests SET status = 'approved', product_key = ?, admin_note = ?, resolved_at = ?, resolved_by = ?
+        WHERE id = ? AND status = 'pending'`,
+    ).bind(key, note, t, adminId, req.id),
+  ])
+  return c.json({ key, reactivated: Boolean(existing) })
+})
+
+admin.post('/product-requests/:id/reject', async (c) => {
+  const body = await c.req.json<{ note?: unknown }>().catch(() => null)
+  const note = typeof body?.note === 'string' ? body.note.trim().slice(0, LIMITS.adminNote) || null : null
+  const r = await c.env.DB.prepare(
+    `UPDATE product_requests SET status = 'rejected', admin_note = ?, resolved_at = ?, resolved_by = ?
+      WHERE id = ? AND status = 'pending'`,
+  )
+    .bind(note, now(), c.get('user')!.id, c.req.param('id'))
+    .run()
+  if (!r.meta.changes) return fail(c, 404, 'not_found', '没有这条待审核的申请')
+  return c.json({ ok: true })
 })
 
 app.route('/admin', admin)

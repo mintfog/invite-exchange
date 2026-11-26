@@ -28,11 +28,13 @@ import {
   ldc,
   parseLdc,
   PAYOUT_STATUS,
+  REQUEST_STATUS,
   timeAgo,
   timeUntil,
   type AdminCode,
   type AdminPayout,
   type AdminProduct,
+  type AdminProductRequest,
   type AdminUser,
   type Mode,
   type PayoutStats,
@@ -44,10 +46,15 @@ const errMsg = (e: unknown, d: string) => (e instanceof ApiError ? e.message : d
 
 export function AdminPage({ version, onChanged }: { version: number; onChanged: () => void }) {
   const [openReports, setOpenReports] = useState(0)
+  const [pendingRequests, setPendingRequests] = useState(0)
   useEffect(() => {
     api.admin
       .reports('open')
       .then((r) => setOpenReports(r.reports.length))
+      .catch(() => {})
+    api.admin
+      .productRequests('pending')
+      .then((r) => setPendingRequests(r.requests.length))
       .catch(() => {})
   }, [version])
 
@@ -55,14 +62,17 @@ export function AdminPage({ version, onChanged }: { version: number; onChanged: 
     <Tabs defaultValue={openReports ? 'reports' : 'products'} key={openReports ? 'r' : 'p'} className="gap-6">
       <div className="flex flex-col gap-1">
         <h1 className="text-2xl font-semibold tracking-tight">管理员</h1>
-        <p className="text-sm text-muted-foreground">管理产品、查看所有人分享的码、处理无效反馈、设置 LDC 奖励。</p>
+        <p className="text-sm text-muted-foreground">管理产品和产品申请、查看所有人分享的码、处理无效反馈、设置 LDC 奖励。</p>
       </div>
       <TabsList className="flex-wrap">
         <TabsTrigger value="reports">
           无效反馈
           {openReports ? <Badge variant="destructive">{openReports}</Badge> : null}
         </TabsTrigger>
-        <TabsTrigger value="products">产品</TabsTrigger>
+        <TabsTrigger value="products">
+          产品
+          {pendingRequests ? <Badge variant="secondary">{pendingRequests}</Badge> : null}
+        </TabsTrigger>
         <TabsTrigger value="codes">邀请码</TabsTrigger>
         <TabsTrigger value="users">用户</TabsTrigger>
         <TabsTrigger value="ldc">LDC 奖励</TabsTrigger>
@@ -235,6 +245,9 @@ type ProductForm = {
   share_reward: string
   claim_reward: string
   locked: boolean
+  /** 通过某条产品申请时才有 */
+  request_id?: string
+  admin_note?: string
 }
 
 const EMPTY_FORM: ProductForm = {
@@ -254,6 +267,10 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
   const [products, setProducts] = useState<AdminProduct[] | null>(null)
   const [form, setForm] = useState<ProductForm | null>(null)
   const [busy, setBusy] = useState(false)
+  const [reqStatus, setReqStatus] = useState<'pending' | 'all'>('pending')
+  const [requests, setRequests] = useState<AdminProductRequest[] | null>(null)
+  const [rejecting, setRejecting] = useState<AdminProductRequest | null>(null)
+  const [rejectNote, setRejectNote] = useState('')
 
   useEffect(() => {
     api.admin
@@ -261,6 +278,37 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
       .then((r) => setProducts(r.products))
       .catch(() => setProducts([]))
   }, [version])
+
+  useEffect(() => {
+    api.admin
+      .productRequests(reqStatus)
+      .then((r) => setRequests(r.requests))
+      .catch(() => setRequests([]))
+  }, [version, reqStatus])
+
+  const approve = (r: AdminProductRequest) =>
+    setForm({
+      ...EMPTY_FORM,
+      name: r.name,
+      mode: r.mode,
+      max_uses: String(r.max_uses ?? 30),
+      description: r.description ?? '',
+      request_id: r.id,
+      admin_note: '',
+    })
+
+  const reject = async () => {
+    if (!rejecting) return
+    try {
+      await api.admin.rejectRequest(rejecting.id, rejectNote)
+      toast(`已拒绝 ${rejecting.name} 的申请`)
+      setRejecting(null)
+      setRejectNote('')
+      onChanged()
+    } catch (e) {
+      toast.error(errMsg(e, '操作失败'))
+    }
+  }
 
   const edit = (p: AdminProduct) =>
     setForm({
@@ -297,9 +345,12 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
     }
     setBusy(true)
     try {
-      if (form.key) await api.admin.updateProduct(form.key, body)
+      if (form.request_id) {
+        const r = await api.admin.approveRequest(form.request_id, { ...body, admin_note: form.admin_note?.trim() || null })
+        toast(r.reactivated ? `已通过，${form.name} 重新上架（沿用原来的设置）` : `已通过，${form.name} 已上架`)
+      } else if (form.key) await api.admin.updateProduct(form.key, body)
       else await api.admin.createProduct(body)
-      toast(form.key ? '已保存' : `已添加 ${form.name}`)
+      if (!form.request_id) toast(form.key ? '已保存' : `已添加 ${form.name}`)
       setForm(null)
       onChanged()
     } catch (e) {
@@ -321,62 +372,74 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
 
   const rewardText = (c: number | null) => (c === null ? '跟随全站' : `${ldc(c)} LDC`)
 
-  return (
+  const requestsCard = (
     <Card>
       <CardHeader>
-        <CardTitle>产品</CardTitle>
-        <CardDescription>广场上的产品只能在这里添加。用户分享时只能从这些产品里选。</CardDescription>
+        <CardTitle>产品申请</CardTitle>
+        <CardDescription>普通用户申请的新产品。通过时可以改名字、模式和奖励，通过后产品直接上架。</CardDescription>
         <CardAction>
-          <Button size="sm" onClick={() => setForm({ ...EMPTY_FORM })}>
-            <Plus />
-            新建产品
-          </Button>
+          <Filter
+            value={reqStatus}
+            options={[
+              ['pending', '待审核'],
+              ['all', '全部'],
+            ]}
+            onChange={setReqStatus}
+          />
         </CardAction>
       </CardHeader>
       <CardContent>
-        {products === null ? (
-          <Skeleton className="h-32" />
-        ) : products.length === 0 ? (
-          <Empty text="还没有产品，点右上角新建。" />
+        {requests === null ? (
+          <Skeleton className="h-20" />
+        ) : requests.length === 0 ? (
+          <Empty text={reqStatus === 'pending' ? '没有待审核的申请。' : '还没有人申请过。'} />
         ) : (
           <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>产品</TableHead>
-                <TableHead>模式</TableHead>
-                <TableHead>码 / 剩余 / 已领</TableHead>
-                <TableHead>奖励（贡献 / 领取）</TableHead>
+                <TableHead>申请人</TableHead>
+                <TableHead>状态</TableHead>
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {products.map((p) => (
-                <TableRow key={p.key}>
-                  <TableCell>
-                    <div className="flex items-center gap-2 font-medium">
-                      {p.name}
-                      {p.active ? null : <Badge variant="secondary">已下架</Badge>}
+              {requests.map((r) => (
+                <TableRow key={r.id}>
+                  <TableCell className="max-w-72 whitespace-normal">
+                    <div className="font-medium">{r.name}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {r.mode === 'multi' ? `多人可用码${r.max_uses ? ` · 每码 ${r.max_uses} 人` : ''}` : '一次性码'}
+                      {r.existing_product && !r.existing_active ? ' · 有同名的已下架产品' : ''}
                     </div>
-                    <span className="text-xs text-muted-foreground">{p.sharers} 位分享者</span>
+                    {r.description ? <div className="text-sm text-muted-foreground">{r.description}</div> : null}
+                    {r.admin_note ? <div className="text-sm">备注：{r.admin_note}</div> : null}
                   </TableCell>
-                  <TableCell className="text-sm">
-                    {p.mode === 'multi'
-                      ? `多人可用 · 每码 ${p.max_uses} 次`
-                      : `一次性 · ${p.max_codes_per_user === null ? '每人不限' : `每人 ${p.max_codes_per_user} 个`}`}
+                  <TableCell>
+                    <UserCell name={r.username} avatar={r.avatar_url} />
+                    <span className="text-xs text-muted-foreground">{timeAgo(r.created_at)}</span>
                   </TableCell>
-                  <TableCell className="tabular-nums">
-                    {p.codes} / {p.available} / {p.claimed}
-                  </TableCell>
-                  <TableCell className="text-sm">
-                    {rewardText(p.share_reward_cents)} / {rewardText(p.claim_reward_cents)}
+                  <TableCell>
+                    <Badge
+                      variant={r.status === 'approved' ? 'default' : r.status === 'rejected' ? 'destructive' : 'outline'}
+                    >
+                      {REQUEST_STATUS[r.status]}
+                    </Badge>
+                    {r.resolved_by_username ? (
+                      <div className="text-xs text-muted-foreground">{r.resolved_by_username}</div>
+                    ) : null}
                   </TableCell>
                   <TableCell className="text-right whitespace-nowrap">
-                    <Button size="sm" variant="ghost" onClick={() => edit(p)}>
-                      编辑
-                    </Button>
-                    <Button size="sm" variant="ghost" onClick={() => toggle(p)}>
-                      {p.active ? '下架' : '上架'}
-                    </Button>
+                    {r.status === 'pending' ? (
+                      <>
+                        <Button size="sm" onClick={() => approve(r)}>
+                          通过
+                        </Button>
+                        <Button size="sm" variant="ghost" onClick={() => setRejecting(r)}>
+                          拒绝
+                        </Button>
+                      </>
+                    ) : null}
                   </TableCell>
                 </TableRow>
               ))}
@@ -385,125 +448,237 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
         )}
       </CardContent>
 
-      <Dialog open={!!form} onOpenChange={(o) => !o && setForm(null)}>
-        <DialogContent className="max-h-[90svh] overflow-y-auto">
+      <Dialog open={!!rejecting} onOpenChange={(o) => !o && setRejecting(null)}>
+        <DialogContent>
           <DialogHeader>
-            <DialogTitle>{form?.key ? `编辑 ${form.name}` : '新建产品'}</DialogTitle>
-            <DialogDescription>选好这个产品的邀请码是怎么用的，系统会按模式分发。</DialogDescription>
+            <DialogTitle>拒绝 {rejecting?.name} 的申请</DialogTitle>
+            <DialogDescription>申请人会在「我的 → 我的申请」里看到理由。拒绝后别人还可以再申请这个产品。</DialogDescription>
           </DialogHeader>
-          {form ? (
-            <div className="flex flex-col gap-4">
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="p-name">名字</Label>
-                <Input id="p-name" value={form.name} maxLength={40} onChange={(e) => set({ name: e.target.value })} />
-              </div>
-              <div className="flex flex-col gap-2">
-                <Label>模式</Label>
-                <div className="grid grid-cols-2 gap-2">
-                  <Button
-                    type="button"
-                    variant={form.mode === 'single' ? 'default' : 'outline'}
-                    disabled={form.locked}
-                    onClick={() => set({ mode: 'single' })}
-                  >
-                    一次性码
-                  </Button>
-                  <Button
-                    type="button"
-                    variant={form.mode === 'multi' ? 'default' : 'outline'}
-                    disabled={form.locked}
-                    onClick={() => set({ mode: 'multi' })}
-                  >
-                    多人可用码
-                  </Button>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  {form.mode === 'single'
-                    ? '每个码只发给一个人，一个人可以分享好几个（比如 ChatterFly 每人 3 个）。'
-                    : '每人只有一个码，可以给很多人用，系统显示剩余次数并轮流发（比如 Muse 一个码 30 人）。'}
-                  {form.locked ? ' 已经有人分享了码，模式不能再改。' : ''}
-                </p>
-              </div>
-              {form.mode === 'multi' ? (
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="p-uses">每个码最多几人用</Label>
-                  <Input
-                    id="p-uses"
-                    type="number"
-                    min={1}
-                    max={1000}
-                    value={form.max_uses}
-                    onChange={(e) => set({ max_uses: e.target.value })}
-                  />
-                </div>
-              ) : (
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="p-per">每人最多分享几个码</Label>
-                  <Input
-                    id="p-per"
-                    type="number"
-                    min={1}
-                    placeholder="留空表示不限"
-                    value={form.max_codes_per_user}
-                    onChange={(e) => set({ max_codes_per_user: e.target.value })}
-                  />
-                </div>
-              )}
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="p-pattern">邀请码格式（可选，正则）</Label>
-                <Input
-                  id="p-pattern"
-                  className="font-mono"
-                  placeholder="比如 CF-[A-Z0-9]{8}，不符合的码放不进来"
-                  value={form.code_pattern}
-                  onChange={(e) => set({ code_pattern: e.target.value })}
-                />
-              </div>
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="p-desc">说明（可选）</Label>
-                <Textarea
-                  id="p-desc"
-                  maxLength={200}
-                  placeholder="显示在广场卡片上，比如：注册后填邀请码，双方都加 TOKEN"
-                  value={form.description}
-                  onChange={(e) => set({ description: e.target.value })}
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="p-share">贡献奖励 LDC</Label>
-                  <Input
-                    id="p-share"
-                    inputMode="decimal"
-                    placeholder="留空跟随全站"
-                    value={form.share_reward}
-                    onChange={(e) => set({ share_reward: e.target.value })}
-                  />
-                </div>
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="p-claim">领取奖励 LDC</Label>
-                  <Input
-                    id="p-claim"
-                    inputMode="decimal"
-                    placeholder="留空跟随全站"
-                    value={form.claim_reward}
-                    onChange={(e) => set({ claim_reward: e.target.value })}
-                  />
-                </div>
-              </div>
-            </div>
-          ) : null}
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="reject-note">理由（可选）</Label>
+            <Textarea
+              id="reject-note"
+              maxLength={200}
+              placeholder="比如：这个产品没有邀请机制 / 已经有同类产品"
+              value={rejectNote}
+              onChange={(e) => setRejectNote(e.target.value)}
+            />
+          </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setForm(null)}>
+            <Button variant="outline" onClick={() => setRejecting(null)}>
               取消
             </Button>
-            <Button onClick={save} disabled={busy || !form?.name.trim()}>
-              {busy ? '保存中…' : '保存'}
+            <Button variant="destructive" onClick={reject}>
+              拒绝
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
     </Card>
+  )
+
+  return (
+    <div className="flex flex-col gap-6">
+      {requestsCard}
+      <Card>
+        <CardHeader>
+          <CardTitle>产品</CardTitle>
+          <CardDescription>广场上的产品只能在这里添加。用户分享时只能从这些产品里选。</CardDescription>
+          <CardAction>
+            <Button size="sm" onClick={() => setForm({ ...EMPTY_FORM })}>
+              <Plus />
+              新建产品
+            </Button>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          {products === null ? (
+            <Skeleton className="h-32" />
+          ) : products.length === 0 ? (
+            <Empty text="还没有产品，点右上角新建。" />
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>产品</TableHead>
+                  <TableHead>模式</TableHead>
+                  <TableHead>码 / 剩余 / 已领</TableHead>
+                  <TableHead>奖励（贡献 / 领取）</TableHead>
+                  <TableHead className="text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {products.map((p) => (
+                  <TableRow key={p.key}>
+                    <TableCell>
+                      <div className="flex items-center gap-2 font-medium">
+                        {p.name}
+                        {p.active ? null : <Badge variant="secondary">已下架</Badge>}
+                      </div>
+                      <span className="text-xs text-muted-foreground">{p.sharers} 位分享者</span>
+                    </TableCell>
+                    <TableCell className="text-sm">
+                      {p.mode === 'multi'
+                        ? `多人可用 · 每码 ${p.max_uses} 次`
+                        : `一次性 · ${p.max_codes_per_user === null ? '每人不限' : `每人 ${p.max_codes_per_user} 个`}`}
+                    </TableCell>
+                    <TableCell className="tabular-nums">
+                      {p.codes} / {p.available} / {p.claimed}
+                    </TableCell>
+                    <TableCell className="text-sm">
+                      {rewardText(p.share_reward_cents)} / {rewardText(p.claim_reward_cents)}
+                    </TableCell>
+                    <TableCell className="text-right whitespace-nowrap">
+                      <Button size="sm" variant="ghost" onClick={() => edit(p)}>
+                        编辑
+                      </Button>
+                      <Button size="sm" variant="ghost" onClick={() => toggle(p)}>
+                        {p.active ? '下架' : '上架'}
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+
+        <Dialog open={!!form} onOpenChange={(o) => !o && setForm(null)}>
+          <DialogContent className="max-h-[90svh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>{form?.request_id ? '通过申请，上架产品' : form?.key ? `编辑 ${form.name}` : '新建产品'}</DialogTitle>
+              <DialogDescription>
+                {form?.request_id
+                  ? '已经按申请填好了，核对后可以修改。保存后产品直接上架。'
+                  : '选好这个产品的邀请码是怎么用的，系统会按模式分发。'}
+              </DialogDescription>
+            </DialogHeader>
+            {form ? (
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="p-name">名字</Label>
+                  <Input id="p-name" value={form.name} maxLength={40} onChange={(e) => set({ name: e.target.value })} />
+                </div>
+                <div className="flex flex-col gap-2">
+                  <Label>模式</Label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button
+                      type="button"
+                      variant={form.mode === 'single' ? 'default' : 'outline'}
+                      disabled={form.locked}
+                      onClick={() => set({ mode: 'single' })}
+                    >
+                      一次性码
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={form.mode === 'multi' ? 'default' : 'outline'}
+                      disabled={form.locked}
+                      onClick={() => set({ mode: 'multi' })}
+                    >
+                      多人可用码
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {form.mode === 'single'
+                      ? '每个码只发给一个人，一个人可以分享好几个（比如 ChatterFly 每人 3 个）。'
+                      : '每人只有一个码，可以给很多人用，系统显示剩余次数并轮流发（比如 Muse 一个码 30 人）。'}
+                    {form.locked ? ' 已经有人分享了码，模式不能再改。' : ''}
+                  </p>
+                </div>
+                {form.mode === 'multi' ? (
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="p-uses">每个码最多几人用</Label>
+                    <Input
+                      id="p-uses"
+                      type="number"
+                      min={1}
+                      max={1000}
+                      value={form.max_uses}
+                      onChange={(e) => set({ max_uses: e.target.value })}
+                    />
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="p-per">每人最多分享几个码</Label>
+                    <Input
+                      id="p-per"
+                      type="number"
+                      min={1}
+                      placeholder="留空表示不限"
+                      value={form.max_codes_per_user}
+                      onChange={(e) => set({ max_codes_per_user: e.target.value })}
+                    />
+                  </div>
+                )}
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="p-pattern">邀请码格式（可选，正则）</Label>
+                  <Input
+                    id="p-pattern"
+                    className="font-mono"
+                    placeholder="比如 CF-[A-Z0-9]{8}，不符合的码放不进来"
+                    value={form.code_pattern}
+                    onChange={(e) => set({ code_pattern: e.target.value })}
+                  />
+                </div>
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="p-desc">说明（可选）</Label>
+                  <Textarea
+                    id="p-desc"
+                    maxLength={200}
+                    placeholder="显示在广场卡片上，比如：注册后填邀请码，双方都加 TOKEN"
+                    value={form.description}
+                    onChange={(e) => set({ description: e.target.value })}
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="p-share">贡献奖励 LDC</Label>
+                    <Input
+                      id="p-share"
+                      inputMode="decimal"
+                      placeholder="留空跟随全站"
+                      value={form.share_reward}
+                      onChange={(e) => set({ share_reward: e.target.value })}
+                    />
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="p-claim">领取奖励 LDC</Label>
+                    <Input
+                      id="p-claim"
+                      inputMode="decimal"
+                      placeholder="留空跟随全站"
+                      value={form.claim_reward}
+                      onChange={(e) => set({ claim_reward: e.target.value })}
+                    />
+                  </div>
+                </div>
+                {form.request_id ? (
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="p-note">给申请人的备注（可选）</Label>
+                    <Input
+                      id="p-note"
+                      maxLength={200}
+                      placeholder="比如：已上架，改成了每码 30 人"
+                      value={form.admin_note ?? ''}
+                      onChange={(e) => set({ admin_note: e.target.value })}
+                    />
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setForm(null)}>
+                取消
+              </Button>
+              <Button onClick={save} disabled={busy || !form?.name.trim()}>
+                {busy ? '保存中…' : form?.request_id ? '通过并上架' : '保存'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </Card>
+    </div>
   )
 }
 

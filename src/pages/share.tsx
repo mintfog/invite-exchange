@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
+import { RequestProductDialog } from '@/components/request-product-dialog'
 
 import { api, ApiError, ldc, loginUrl, type Limits, type Product, type User } from '@/lib/api'
 
@@ -22,6 +23,7 @@ export function SharePage({ user, limits, version, onShared }: Props) {
   const [uses, setUses] = useState('')
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
+  const [requesting, setRequesting] = useState(false)
 
   useEffect(() => {
     api
@@ -101,7 +103,7 @@ export function SharePage({ user, limits, version, onShared }: Props) {
             {products === null ? (
               <Skeleton className="h-10" />
             ) : products.length === 0 ? (
-              <p className="text-sm text-muted-foreground">还没有产品。产品由管理员添加，添加后就能在这里选。</p>
+              <p className="text-sm text-muted-foreground">还没有产品。可以申请一个，管理员通过后就能在这里选。</p>
             ) : (
               <div className="flex flex-wrap gap-2">
                 {products.map((p) => (
@@ -117,7 +119,12 @@ export function SharePage({ user, limits, version, onShared }: Props) {
                 ))}
               </div>
             )}
-            <p className="text-xs text-muted-foreground">没有你要的产品？产品只能由管理员添加，可以联系管理员。</p>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              没有你要的产品？
+              <Button type="button" size="sm" variant="link" className="h-auto p-0 text-xs" onClick={() => setRequesting(true)}>
+                申请新产品
+              </Button>
+            </div>
           </div>
 
           {product ? (
@@ -227,6 +234,7 @@ export function SharePage({ user, limits, version, onShared }: Props) {
           </CardFooter>
         ) : null}
       </form>
+      <RequestProductDialog open={requesting} onClose={() => setRequesting(false)} />
     </Card>
   )
 }

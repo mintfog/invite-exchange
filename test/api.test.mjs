@@ -620,6 +620,78 @@ try {
     ok('测试账号分享的码被领取，不会记 LDC 奖励')
   }
 
+  console.log('申请新产品')
+  {
+    const pr = await new Client().devLogin('requester')
+    const pr2 = await new Client().devLogin('requester2')
+    assert.equal((await new Client().json('/api/product-requests', 'POST', { name: 'Zed' })).status, 401)
+    assert.equal((await pr.json('/api/product-requests', 'POST', { name: '' })).status, 400)
+    const dup = await pr.json('/api/product-requests', 'POST', { name: 'echo' })
+    assert.equal(dup.status, 409)
+    assert.equal(dup.data.error, 'exists')
+    ok('没登录不能申请；广场上已有的产品不能再申请')
+
+    const a = await pr.json('/api/product-requests', 'POST', {
+      name: ' Zed  AI ',
+      mode: 'multi',
+      max_uses: 10,
+      description: '注册时填码，双方都加额度',
+    })
+    assert.equal(a.status, 200)
+    const same = await pr2.json('/api/product-requests', 'POST', { name: 'zed ai' })
+    assert.equal(same.status, 409)
+    assert.equal(same.data.error, 'already_requested')
+    ok('提交申请；同一个产品同时只能有一条待审核')
+
+    await pr.json('/api/product-requests', 'POST', { name: 'Req B' })
+    await pr.json('/api/product-requests', 'POST', { name: 'Req C' })
+    const over = await pr.json('/api/product-requests', 'POST', { name: 'Req D' })
+    assert.equal(over.status, 429)
+    ok('每人同时最多 3 条待审核')
+
+    const mine = (await pr.json('/api/my/product-requests')).data.requests
+    assert.equal(mine.length, 3)
+    assert.equal(mine.find((r) => r.id === a.data.id).name, 'Zed AI')
+    const c = mine.find((r) => r.name === 'Req C')
+    assert.equal((await pr2.json(`/api/product-requests/${c.id}`, 'DELETE')).status, 404)
+    assert.equal((await pr.json(`/api/product-requests/${c.id}`, 'DELETE')).status, 200)
+    assert.equal((await pr.json('/api/product-requests', 'POST', { name: 'Req D' })).status, 200)
+    ok('申请人能看到自己的申请，能撤回，别人撤不了')
+
+    assert.equal((await pr.json('/api/admin/product-requests')).status, 403)
+    const pending = (await boss.json('/api/admin/product-requests')).data.requests
+    assert.ok(pending.some((r) => r.id === a.data.id && r.username === 'requester'))
+    assert.equal((await pr.json(`/api/admin/product-requests/${a.data.id}/approve`, 'POST', {})).status, 403)
+    ok('只有管理员能看和审核申请')
+
+    const ok1 = await boss.json(`/api/admin/product-requests/${a.data.id}/approve`, 'POST', {
+      admin_note: '已上架',
+      share_reward_cents: 200,
+    })
+    assert.equal(ok1.status, 200)
+    const prods = (await pr.json('/api/products')).data.products
+    const zed = prods.find((p) => p.key === ok1.data.key)
+    assert.equal(zed.name, 'Zed AI')
+    assert.equal(zed.mode, 'multi')
+    assert.equal(zed.max_uses, 10)
+    const again = await boss.json(`/api/admin/product-requests/${a.data.id}/approve`, 'POST', {})
+    assert.equal(again.status, 404)
+    const mine2 = (await pr.json('/api/my/product-requests')).data.requests
+    const done = mine2.find((r) => r.id === a.data.id)
+    assert.equal(done.status, 'approved')
+    assert.equal(done.admin_note, '已上架')
+    ok('管理员通过：按申请建好产品（多人可用、10 次），可以改设置，申请人看到已通过')
+
+    const b = mine2.find((r) => r.name === 'Req B')
+    assert.equal((await boss.json(`/api/admin/product-requests/${b.id}/reject`, 'POST', { note: '太冷门' })).status, 200)
+    const rej = (await pr.json('/api/my/product-requests')).data.requests.find((r) => r.id === b.id)
+    assert.equal(rej.status, 'rejected')
+    assert.equal(rej.admin_note, '太冷门')
+    assert.ok(!(await pr.json('/api/products')).data.products.some((p) => p.name === 'Req B'))
+    assert.equal((await pr2.json('/api/product-requests', 'POST', { name: 'Req B' })).status, 200)
+    ok('管理员拒绝：不建产品，申请人看到理由；拒绝后别人可以再申请')
+  }
+
   console.log(`\n全部通过：${passed} 项`)
 } catch (e) {
   console.error('\n测试失败：', e)

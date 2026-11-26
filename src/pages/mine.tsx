@@ -5,7 +5,7 @@ import { toast } from 'sonner'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
@@ -23,17 +23,20 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 import { CopyButton } from '@/components/copy-button'
 import { ReportDialog } from '@/components/report-dialog'
+import { RequestProductDialog } from '@/components/request-product-dialog'
 import {
   api,
   ApiError,
   ldc,
   loginUrl,
   PAYOUT_STATUS,
+  REQUEST_STATUS,
   timeAgo,
   timeUntil,
   type Claim,
   type Claimer,
   type MyPayout,
+  type ProductRequest,
   type SharedCode,
   type SharedSummary,
   type User,
@@ -50,6 +53,9 @@ export function MinePage({ user, version, onChanged }: Props) {
   const [editing, setEditing] = useState<SharedCode | null>(null)
   const [remaining, setRemaining] = useState('')
   const [reporting, setReporting] = useState<Claim | null>(null)
+  const [requests, setRequests] = useState<ProductRequest[] | null>(null)
+  const [requesting, setRequesting] = useState(false)
+  const [reqVersion, setReqVersion] = useState(0)
 
   useEffect(() => {
     if (!user) return
@@ -67,6 +73,14 @@ export function MinePage({ user, version, onChanged }: Props) {
       .then((r) => setClaims(r.claims))
       .catch(() => setClaims([]))
   }, [user, version])
+
+  useEffect(() => {
+    if (!user) return
+    api
+      .myRequests()
+      .then((r) => setRequests(r.requests))
+      .catch(() => setRequests([]))
+  }, [user, version, reqVersion])
 
   if (!user) {
     return (
@@ -121,6 +135,18 @@ export function MinePage({ user, version, onChanged }: Props) {
     }
   }
 
+  const cancelRequest = async (id: string) => {
+    try {
+      await api.cancelRequest(id)
+      toast('已撤回申请')
+      setReqVersion((v) => v + 1)
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : '撤回失败')
+    }
+  }
+
+  const pendingRequests = requests?.filter((r) => r.status === 'pending').length ?? 0
+
   const byCode = (id: string) => claimers.filter((x) => x.code_id === id)
   const hasRewards = payouts.length > 0 || !!summary?.rewarded_cents
 
@@ -129,6 +155,10 @@ export function MinePage({ user, version, onChanged }: Props) {
       <TabsList>
         <TabsTrigger value="shared">我分享的</TabsTrigger>
         <TabsTrigger value="claimed">我领到的</TabsTrigger>
+        <TabsTrigger value="requests">
+          我的申请
+          {pendingRequests ? <Badge variant="secondary">{pendingRequests}</Badge> : null}
+        </TabsTrigger>
       </TabsList>
 
       <TabsContent value="shared" className="flex flex-col gap-6">
@@ -297,6 +327,67 @@ export function MinePage({ user, version, onChanged }: Props) {
           </CardContent>
         </Card>
       </TabsContent>
+
+      <TabsContent value="requests">
+        <Card>
+          <CardHeader>
+            <CardTitle>我的申请</CardTitle>
+            <CardDescription>广场上没有的产品可以申请，管理员通过后就会上架。同时最多 3 个申请在等审核。</CardDescription>
+            <CardAction>
+              <Button size="sm" onClick={() => setRequesting(true)}>
+                申请新产品
+              </Button>
+            </CardAction>
+          </CardHeader>
+          <CardContent className="flex flex-col">
+            {requests === null ? (
+              <Skeleton className="h-24" />
+            ) : requests.length === 0 ? (
+              <p className="py-6 text-center text-sm text-muted-foreground">还没有申请过新产品。</p>
+            ) : (
+              requests.map((r, i) => (
+                <div key={r.id}>
+                  {i > 0 ? <Separator /> : null}
+                  <div className="flex flex-col gap-2 py-4 sm:flex-row sm:items-center">
+                    <div className="flex min-w-0 flex-1 flex-col gap-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{r.name}</span>
+                        <Badge
+                          variant={
+                            r.status === 'approved' ? 'default' : r.status === 'rejected' ? 'destructive' : 'outline'
+                          }
+                        >
+                          {REQUEST_STATUS[r.status]}
+                        </Badge>
+                        <span className="text-xs text-muted-foreground">
+                          {r.mode === 'multi' ? `多人可用码${r.max_uses ? ` · 每码 ${r.max_uses} 人` : ''}` : '一次性码'} ·{' '}
+                          {timeAgo(r.created_at)}
+                        </span>
+                      </div>
+                      {r.description ? <span className="text-sm text-muted-foreground">{r.description}</span> : null}
+                      {r.admin_note ? <span className="text-sm">管理员：{r.admin_note}</span> : null}
+                      {r.status === 'approved' ? (
+                        <span className="text-xs text-muted-foreground">已经上架，可以去分享了。</span>
+                      ) : null}
+                    </div>
+                    {r.status === 'pending' ? (
+                      <Button variant="ghost" size="sm" onClick={() => cancelRequest(r.id)}>
+                        撤回
+                      </Button>
+                    ) : null}
+                  </div>
+                </div>
+              ))
+            )}
+          </CardContent>
+        </Card>
+      </TabsContent>
+
+      <RequestProductDialog
+        open={requesting}
+        onClose={() => setRequesting(false)}
+        onDone={() => setReqVersion((v) => v + 1)}
+      />
 
       <Dialog open={!!editing} onOpenChange={(o) => !o && setEditing(null)}>
         <DialogContent>

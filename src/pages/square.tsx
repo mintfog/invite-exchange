@@ -5,6 +5,7 @@ import { toast } from 'sonner'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { RequestProductDialog } from '@/components/request-product-dialog'
 import { Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Dialog,
@@ -48,6 +49,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
   const [claim, setClaim] = useState<NewClaim | null>(null)
   const [thanked, setThanked] = useState(false)
   const [reporting, setReporting] = useState<NewClaim | null>(null)
+  const [requesting, setRequesting] = useState(false)
 
   useEffect(() => {
     api
@@ -145,9 +147,18 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
             <CardHeader>
               <CardTitle>{query ? '没有找到这个产品' : '广场还没有产品'}</CardTitle>
               <CardDescription>
-                {query ? '产品由管理员添加，想要新产品可以联系管理员。' : '管理员添加产品后，就可以分享和领取邀请码了。'}
+                {user
+                  ? '想分享的产品还没有？可以申请一个，管理员通过后就会出现在这里。'
+                  : '登录后可以申请新产品，管理员通过后就会出现在这里。'}
               </CardDescription>
             </CardHeader>
+            {user ? (
+              <CardFooter>
+                <Button variant="outline" onClick={() => setRequesting(true)}>
+                  申请新产品
+                </Button>
+              </CardFooter>
+            ) : null}
           </Card>
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -241,6 +252,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
         onClose={() => setReporting(null)}
         onDone={onChanged}
       />
+      <RequestProductDialog open={requesting} initialName={query.trim()} onClose={() => setRequesting(false)} />
     </div>
   )
 }
