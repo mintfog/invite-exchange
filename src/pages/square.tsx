@@ -224,6 +224,13 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
                   </div>
                   <RewardLine product={p} />
                   <RelayLine product={p} />
+                  {p.deposit_base_cents !== null && p.available - p.mine_available <= 0 ? (
+                    <span className="text-foreground">
+                      {p.waiting_relays > 0
+                        ? `已有 ${p.waiting_relays} 人付了押金领走码、还没放回自己的码，可以稍后再来看看`
+                        : '码暂时领完了，等有人放回码后再来看看'}
+                    </span>
+                  ) : null}
                 </CardContent>
                 <CardFooter>
                   <ClaimButton
@@ -413,7 +420,7 @@ function ClaimButton({
   if (othersAvailable <= 0) {
     return (
       <Button variant="secondary" className="w-full" disabled>
-        {product.available > 0 ? '只剩你自己的码' : '暂无可领'}
+        {product.available > 0 ? '只剩你自己的码' : product.deposit_base_cents !== null ? '暂无可领，稍后再试' : '暂无可领'}
       </Button>
     )
   }

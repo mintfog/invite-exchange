@@ -35,6 +35,8 @@ export type Product = {
   deposit_base_cents: number | null
   /** 分档押金：信任等级达到 level 时押金改成 cents */
   deposit_tiers: DepositTier[]
+  /** 接力产品：领到后还没放回自己码的人数 */
+  waiting_relays: number
   /** 我领要付的押金（分）；null = 不用付 */
   deposit_cents: number | null
   /** 我已经付好、还没用的押金 */

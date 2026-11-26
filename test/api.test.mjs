@@ -839,10 +839,14 @@ try {
     let mine = (await r1.json('/api/my/claimed')).data.claims.find((x) => x.product_key === key || x.code === 'RELAY-0')
     assert.equal(mine.deposit_status, 'used')
     assert.equal(mine.relayed, 0)
+    const waiting = (await r2.json('/api/products')).data.products.find((p) => p.key === key)
+    assert.equal(waiting.available, 0)
+    assert.equal(waiting.waiting_relays, 1)
     const sh1 = await r1.json('/api/codes', 'POST', { product_key: key, codes: 'RELAY-1' })
     assert.equal(sh1.data.relayed, 1)
     ok('付了押金就能领；领到后放回自己的码，记为接力')
 
+    assert.equal((await r2.json('/api/products')).data.products.find((p) => p.key === key).waiting_relays, 0)
     const before = refundCalls.length
     await boss.json('/api/admin/deposits/run', 'POST')
     assert.equal(refundCalls.length, before)

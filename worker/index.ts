@@ -543,6 +543,8 @@ app.get('/products', async (c) => {
     `SELECT p.key, p.name, p.mode, p.max_uses, p.max_codes_per_user, p.description,
             p.share_reward_cents, p.claim_reward_cents, p.relay_required,
             p.deposit_cents AS own_deposit_cents, p.min_trust_level AS own_min_trust, p.deposit_tiers,
+            (SELECT COUNT(*) FROM relay_deposits d
+              WHERE d.product_key = p.key AND d.status = 'used' AND d.relay_code_id IS NULL) AS waiting_relays,
             EXISTS (SELECT 1 FROM relay_deposits d
                      WHERE d.user_id = ?1 AND d.product_key = p.key AND d.status = 'paid') AS has_deposit,
             p.code_pattern IS NOT NULL AS has_pattern,
