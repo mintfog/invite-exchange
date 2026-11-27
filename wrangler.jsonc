@@ -29,7 +29,8 @@
     "MAX_CLAIMS_PER_DAY": "5",
     // 每人 24 小时内最多分享几个码
     "MAX_SHARES_PER_DAY": "30",
-    "LINUXDO_BASE": "https://connect.linux.do"
+    "LINUXDO_BASE": "https://connect.linux.do",
+    "DEV_LOGIN": "0"
   }
   // 机密不要写在这里，用 wrangler secret put：
   //   LINUXDO_CLIENT_ID, LINUXDO_CLIENT_SECRET
