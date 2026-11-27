@@ -721,7 +721,7 @@ function ProductsPanel({ version, onChanged }: { version: number; onChanged: () 
                     </Button>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    需要接力时，领码前先付押金；领到的人放回自己的码、被别人领走后押金退回。总开关在「接力押金」里。
+                    需要接力时，领码前先付押金；领到的人放回自己的码后，满 5 小时无人领或被领走且通过观察期，押金退回。总开关在「接力押金」里。
                   </p>
                 </div>
                 {form.relay ? (
@@ -1439,8 +1439,7 @@ function RelayPanel({ version, onChanged }: { version: number; onChanged: () => 
         <CardHeader>
           <CardTitle>接力设置</CardTitle>
           <CardDescription>
-            开启后，标了「需要接力」的产品领码前要先付押金。领到的人把自己的同产品邀请码放回分享，被别人领走、过了观察期（和 LDC
-            奖励同一个观察期）没人反馈无效，押金自动原路退回。
+            开启后，标了「需要接力」的产品领码前要先付押金。领到的人把自己的同产品邀请码放回分享。满 5 小时无人领，或被领走且过了观察期没人反馈无效，押金自动原路退回。
           </CardDescription>
           <CardAction>
             {settings ? (

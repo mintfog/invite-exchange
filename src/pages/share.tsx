@@ -76,7 +76,7 @@ export function SharePage({ user, limits, version, onShared }: Props) {
         toast.error('这些码已经在池子里了')
       } else {
         toast(`已放入 ${r.added} 个码${r.duplicates ? `，${r.duplicates} 个重复已跳过` : ''}`, {
-          description: r.relayed ? '已记为接力：这个码被别人领走后，你的押金会自动退回' : undefined,
+          description: r.relayed ? '已记为接力。这个码满 5 小时无人领，或被领走且通过观察期，押金会自动退回' : undefined,
         })
         setCodes('')
         setUses('')

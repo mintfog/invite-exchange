@@ -318,7 +318,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
               <AlertTitle>记得接力，押金才能退回</AlertTitle>
               <AlertDescription>
                 <p>
-                  注册好以后，把你自己的 {claim.product} 邀请码放进分享。它被别人领走、过了观察期没人反馈无效，
+                  注册好以后，把你自己的 {claim.product} 邀请码放进分享。满 5 小时无人领，或被领走且过了观察期无人反馈无效，
                   {ldc(claim.deposit_cents)} LDC 押金会原路退回。
                 </p>
                 <Button
@@ -371,7 +371,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
           <ol className="flex list-decimal flex-col gap-1 pl-5 text-sm text-muted-foreground">
             <li>付好押金后回到这里，点「领一个」。</li>
             <li>用领到的码注册后，把你自己的 {depositFor?.name} 邀请码放进分享。</li>
-            <li>你的码被别人领走、过了观察期没人反馈无效，押金原路退回。</li>
+            <li>放回的码满 5 小时无人领，或被领走且过了观察期没人反馈无效，押金原路退回。</li>
           </ol>
           <p className="text-sm text-muted-foreground">
             没领到码，或领到的码被确认无效，可以在「我的 → 押金」里自己退回。
@@ -400,7 +400,7 @@ export function SquarePage({ user, limits, version, onChanged, onGoShare }: Prop
           <ol className="flex list-decimal flex-col gap-1 pl-5 text-sm text-muted-foreground">
             <li>有人排队时，每放回 3 个码，2 个留给现领的人，1 个按付款先后发给排队的人。码放回 10 分钟没人现领，也直接发给排队的人。</li>
             <li>排到时网页会响铃、弹出系统通知，码会出现在「我的 → 我领到的」。网页开着才能听到提醒，允许通知会更稳。</li>
-            <li>用码注册后放回你自己的码，它被别人领走、过了观察期，排队押金全部原路退回。</li>
+            <li>用码注册后放回你自己的码。满 5 小时无人领，或被领走且过了观察期没人反馈无效，排队押金全额原路退回。</li>
           </ol>
           <p className="text-sm text-muted-foreground">
             还没排到时，可以在「我的 → 押金」里取消排队，押金全部退回。
@@ -447,7 +447,7 @@ function RelayLine({ product: p }: { product: Product }) {
     ? '你的押金已付，可以领了'
     : p.deposit_cents === null
       ? '你的等级够了，免押金'
-      : `你领要付 ${ldc(p.deposit_cents)} LDC，放回你的码被领走后退回`
+      : `你领要付 ${ldc(p.deposit_cents)} LDC，放回你的码后按接力规则退回`
   return (
     <span className="flex items-start gap-1 text-foreground">
       <Repeat className="mt-0.5 size-4 shrink-0" />

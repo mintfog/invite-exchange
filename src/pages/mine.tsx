@@ -421,7 +421,7 @@ export function MinePage({ user, version, onChanged }: Props) {
             <CardHeader>
               <CardTitle>接力押金</CardTitle>
               <CardDescription>
-                领接力产品前付的押金和排队押金。领到后把你自己的同产品邀请码放进分享，被别人领走、过了观察期没人反馈无效，押金自动原路退回。
+                领接力产品前付的押金和排队押金。领到后把你自己的同产品邀请码放进分享。满 5 小时无人领，或被领走且过了观察期没人反馈无效，押金自动原路退回。
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -546,10 +546,10 @@ function DepositNote({ claim: c }: { claim: Claim }) {
   const text =
     c.deposit_status === 'used'
       ? c.relayed
-        ? `已放回你的 ${c.product} 码，等别人领走后退 ${amount}`
-        : `还没放回你自己的 ${c.product} 码：去「分享」放进去，被领走后退 ${amount}`
+        ? `已放回你的 ${c.product} 码，满 5 小时无人领或通过领取观察期后退 ${amount}`
+        : `还没放回你自己的 ${c.product} 码，请去「分享」放回，之后按接力规则退 ${amount}`
       : c.deposit_status === 'refund_due'
-        ? `你放回的码已被领走，${amount}${c.refund_due_at ? ` ${timeUntil(c.refund_due_at)}` : ''}退回`
+        ? `${amount}${c.refund_due_at ? ` ${timeUntil(c.refund_due_at)}` : ''}退回`
         : `${amount}：${DEPOSIT_STATUS[c.deposit_status]}`
   return <span className="text-xs text-foreground">{text}</span>
 }

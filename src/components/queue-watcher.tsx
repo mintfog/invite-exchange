@@ -126,7 +126,7 @@ export function QueueWatcher({
           <Repeat />
           <AlertTitle>记得接力，押金才能退回</AlertTitle>
           <AlertDescription>
-            注册好以后，把你自己的 {current?.product} 邀请码放进分享。它被别人领走、过了观察期没人反馈无效，排队押金会全部原路退回。
+            注册好以后，把你自己的 {current?.product} 邀请码放进分享。满 5 小时无人领，或被领走且过了观察期没人反馈无效，排队押金会全额原路退回。
           </AlertDescription>
         </Alert>
         <DialogFooter>

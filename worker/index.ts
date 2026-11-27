@@ -880,27 +880,26 @@ app.post('/codes', async (c) => {
 
   const ids = codes.map(() => crypto.randomUUID())
   const fresh = codes.map((_, i) => i).filter((i) => !check.skip.has(hashes[i]))
-  const res = !fresh.length ? [] : await c.env.DB.batch(
-    fresh.map((i) =>
+  const res = !fresh.length ? [] : await c.env.DB.batch([
+    ...fresh.map((i) =>
       c.env.DB.prepare(
         `INSERT OR IGNORE INTO codes (id, sharer_id, product_key, code, note, status, created_at, max_uses, code_hash)
          VALUES (?, ?, ?, ?, ?, 'available', ?, ?, ?)`,
       ).bind(ids[i], user.id, product.key, codes[i], note, t, uses, hashes[i]),
     ),
-  )
-  const added = res.reduce((a, r) => a + (r.meta.changes ?? 0), 0)
-  // 放回了自己的码：这个产品已用来领码的押金记下这个码，等它被别人领走后退押金
-  const firstNew = fresh.map((i) => ids[i]).find((_, k) => res[k].meta.changes)
-  let relayed = 0
-  if (firstNew) {
-    const r = await c.env.DB.prepare(
-      `UPDATE relay_deposits SET relay_code_id = ?, updated_at = ?
-        WHERE user_id = ? AND product_key = ? AND status = 'used' AND relay_code_id IS NULL`,
+    c.env.DB.prepare(
+      `WITH first_code AS (
+        SELECT c.id FROM json_each(?1) f JOIN codes c ON c.id = f.value
+         ORDER BY f.key LIMIT 1
+      )
+      UPDATE relay_deposits SET relay_code_id = first_code.id, updated_at = ?2
+        FROM first_code
+       WHERE user_id = ?3 AND product_key = ?4 AND status = 'used' AND relay_code_id IS NULL`,
     )
-      .bind(firstNew, t, user.id, product.key)
-      .run()
-    relayed = r.meta.changes ?? 0
-  }
+      .bind(JSON.stringify(fresh.map((i) => ids[i])), t, user.id, product.key),
+  ])
+  const relayed = res.pop()?.meta.changes ?? 0
+  const added = res.reduce((a, r) => a + (r.meta.changes ?? 0), 0)
   if (added) await serveQueue(c.env, product.key, waitUntilOf(c))
   return c.json({ added, duplicates: codes.length - added, product_key: product.key, relayed })
 })
@@ -1157,17 +1156,31 @@ async function refundDeposit(env: Env, id: string, from: string[]) {
   return { ok: true as const }
 }
 
-// 定时退押金：放回的码被别人领了、观察期过了、这个码没有待处理的无效反馈
+const RELAY_IDLE_REFUND_MS = 5 * 60 * 60 * 1000
+
 export async function runRefunds(env: Env, limit = 25) {
   const out = { refunded: 0, failed: 0 }
   if (!ldcConfigured(env)) return out
+  const t = now()
+  await env.DB.prepare(
+    `UPDATE relay_deposits SET status = 'refund_due', refund_due_at = updated_at + ?1, updated_at = ?2
+      WHERE id IN (
+        SELECT d.id FROM relay_deposits d JOIN codes c ON c.id = d.relay_code_id
+         WHERE d.status = 'used' AND d.updated_at <= ?2 - ?1 AND d.trade_no IS NOT NULL
+           AND c.status = 'available' AND c.invalid_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM claims x WHERE x.code_id = c.id)
+         ORDER BY d.updated_at, d.id LIMIT ?3
+      )`,
+  )
+    .bind(RELAY_IDLE_REFUND_MS, t, limit)
+    .run()
   const { results } = await env.DB.prepare(
     `SELECT d.id FROM relay_deposits d
       WHERE d.status = 'refund_due' AND d.refund_due_at <= ?
         AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.code_id = d.relay_code_id AND r.status = 'open')
       ORDER BY d.refund_due_at LIMIT ?`,
   )
-    .bind(now(), limit)
+    .bind(t, limit)
     .all<{ id: string }>()
   for (const { id } of results) {
     const r = await refundDeposit(env, id, ['refund_due'])
@@ -1193,7 +1206,7 @@ app.post('/products/:key/deposit', async (c) => {
   }
   if (queue && rules.base === null) return fail(c, 409, 'no_queue', `${product.name} 不用接力，没有排队`)
   const premium = queue ? (await getSettings(c.env.DB)).queue_premium_cents : 0
-  // 排队押金 = 你领这个产品的正常押金 + 排队加价，放回码被别人领走后一起退
+  // 排队押金 = 你领这个产品的正常押金 + 排队加价，和正常押金一起原路退回
   const amount = (rules.deposit ?? 0) + premium
   if (!amount) return fail(c, 409, 'no_deposit_needed', `你领 ${product.name} 不用押金`)
   if (!ldcConfigured(c.env)) return fail(c, 409, 'ldc_not_configured', '站点还没接上 LINUX DO Credit，暂时付不了押金')
@@ -1342,7 +1355,7 @@ app.post('/deposits/:id/refund', async (c) => {
     .bind(c.req.param('id'), user.id)
     .first<{ id: string; status: string }>()
   if (!d) return fail(c, 404, 'not_found', '没有这笔押金')
-  if (d.status !== 'paid') return fail(c, 409, 'not_refundable', '这笔押金已经用来领码了，要等你放回的码被别人领走才退')
+  if (d.status !== 'paid') return fail(c, 409, 'not_refundable', '这笔押金已用来领码，请放回自己的同产品邀请码，系统会按接力规则自动退款')
   if (!ldcConfigured(c.env)) return fail(c, 409, 'ldc_not_configured', '站点还没接上 LINUX DO Credit')
   const r = await refundDeposit(c.env, d.id, ['paid'])
   if (!r.ok) return fail(c, 409, 'refund_failed', `退款没成功：${r.error}`)
@@ -1412,10 +1425,15 @@ async function grantCode(
   // 领到的是别人用来接力的码：那个人的押金在观察期后退回
   const s = await getSettings(env.DB)
   await env.DB.prepare(
-    `UPDATE relay_deposits SET status = 'refund_due', refund_due_at = ?, updated_at = ?
-      WHERE relay_code_id = ? AND status = 'used'`,
+    `UPDATE relay_deposits SET status = 'refund_due', updated_at = ?1,
+        refund_due_at = CASE
+          WHEN updated_at + ?2 <= (SELECT MIN(x.claimed_at) FROM claims x WHERE x.code_id = ?4)
+          THEN updated_at + ?2
+          ELSE ?1 + ?3
+        END
+      WHERE relay_code_id = ?4 AND status = 'used'`,
   )
-    .bind(t + s.hold_hours * 60 * 60 * 1000, t, row.code_id)
+    .bind(t, RELAY_IDLE_REFUND_MS, s.hold_hours * 60 * 60 * 1000, row.code_id)
     .run()
   // 接力链：A 分享 → B 领了 A 的码 → B 放回自己的码 → 现在被领走。
   // 说明 B 用 A 的码注册成功了，A 的押金不用再等观察期，马上退。
@@ -1528,7 +1546,7 @@ app.post('/claim', async (c) => {
       .bind(user.id, key)
       .first<{ id: string }>()
     if (!deposit) {
-      return fail(c, 402, 'deposit_required', `领这个产品要先付 ${cents(depositCents)} LDC 押金，放回你自己的码并被别人领走后退回`)
+      return fail(c, 402, 'deposit_required', `领这个产品要先付 ${cents(depositCents)} LDC 押金。放回你自己的同产品邀请码后，系统会按接力规则自动退款`)
     }
   }
 
