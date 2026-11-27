@@ -1,6 +1,19 @@
 # 邀请码交换
 
-分享多余的产品邀请码（Muse、ChatterFly、小豆……），用 LinuxDO 账号登录后每个产品领一个。码被领走立刻从广场消失，只有领取人和分享者能看到；分享者能看到是谁领走、有没有点感谢。
+分享多余的产品邀请码（Muse、ChatterFly、小豆……），用 LinuxDO 账号登录后每个产品领一个。码池里的码对所有人隐藏，只有领取人和分享者能看到；分享者能看到是谁用了、有没有点感谢。
+
+- **产品由管理员添加**（`ADMIN_USERNAMES` 里的 LinuxDO 用户名），用户分享时只能选已有产品。
+- **两种模式**：一次性码（如 ChatterFly，每个码只给一个人，每人可放几个）；多人可用码（如 Muse，每人一个码、最多 N 人用，显示剩余次数）。
+- **随机轮流发**：领取时优先发给被领得最少的分享者，同样少的随机挑，每个分享者都能被用到。
+- **LDC 奖励**：通过 LINUX DO Credit 从站长的商户账户给分享者发 LDC。贡献奖励（每个码首次被领）和领取奖励（每被领一次）可在管理页设置，单个产品可覆盖；领取后先过观察期，没人反馈无效才发；全站 24 小时有上限。管理员可以对单笔奖励或某个用户的全部待发奖励「立即发放」，跳过观察期（被反馈无效扣下的不发，24 小时上限照样算）。
+- **无效反馈**：领取人可以反馈码用不了，管理员确认后撤下码、取消奖励，反馈人可以再领一个。
+- **接力押金**：管理员可以把产品标成「需要接力」并在「管理 → 接力押金」里开启。领这类产品前，用户先通过 LINUX DO Credit 付押金；领到后把自己的同产品邀请码放回分享，等它被别人领走、过了观察期没人反馈无效，押金自动原路退回。没用上的押金（没领到、领到的码被确认无效）用户可以自己退；放回的码被确认无效则要重新放回。管理员可以手动退回或没收。每个接力产品可以单独设押金，并按 LinuxDO 信任等级分档减免（比如 3 级减半、4 级免押金）。
+- **预约排队**：接力产品暂时没码时，用户可以付「正常押金 + 排队加价（默认 200 LDC，管理员可改）」排队。有人排队时，每放回 3 个码，2 个留给现领的人、1 个按付款先后自动发给排队的人；码放回 10 分钟没人现领也直接发给排队的人。网页开着时排到会响铃、弹系统通知和弹窗。排到的码接力完成后，排队押金全部退回；没排到可以随时取消，全部退回。接力产品卡片上显示当前有几条接力链（池里能领的码 + 已领走还没放回的）。
+- **接力链图**：点接力产品的卡片，弹出每条正在运作的接力链，从最早分享的人到链现在走到的地方（码在池子里，或在某人手里等 TA 放回）。链上的人只显示头像，头像走本站匿名地址 `/api/avatars/{随机编号}`，不带 LinuxDO 用户名。
+- **自己退还用不了的码**：领到 24 小时内，领取人可以自己退还（30 天内最多 3 次）。一次性码直接作废、不再发给别人，分享者拿不到这个码的奖励；多人可用码只作废这一次领取，码留给管理员判断。付过押金的话押金回到「已付」，可以再领一个或退回。管理员在无效反馈里能看到哪些是自己退还的。
+- **重复码校验**：分享时把码规范化（去空白、转小写）后存一个 SHA-256 指纹，码被领走、撤回、作废后也保留。被领过或被确认无效的码不能再分享，防止一个码在两个号之间来回倒；池子里已有的码算重复跳过；自己撤回、没人领过的码可以重新放回。
+- **每个产品的最低领取等级**：可以给单个产品设 LinuxDO 信任等级要求（0 到 4），不设就用全站的 `MIN_TRUST_LEVEL`。
+- **申请新产品**：普通用户可以申请广场上还没有的产品（每人同时最多 3 条待审核），管理员在「管理 → 产品」里通过（可改设置，通过后直接上架）或拒绝并说明理由。
 
 - 前端：React + Vite + shadcn/ui 官方组件（黑白灰 neutral 主题）
 - 后端：Cloudflare Worker（Hono），和前端在同一个 Worker 里，`/api/*` 走接口，其他走静态页面
@@ -18,7 +31,7 @@
 | 自己分享的码 | 自己领不到 |
 | 被禁言或未激活的 LinuxDO 账号 | 不能登录 |
 
-领取是一条 D1 `UPDATE … RETURNING` 语句完成的，挑码、确认没人领、确认没超限、标记领走在同一步里，所以两个人同时点也不会拿到同一个码（`test/api.test.mjs` 里有 20 人抢 5 个码的测试）。
+领取是一条 D1 `INSERT … SELECT … RETURNING` 语句完成的，挑码、确认没领过、确认没超限、记一次领取在同一步里，码用满时由触发器标记，所以同时点也不会超发（`test/api.test.mjs` 里有 20 人抢 5 个码、20 人抢一个 5 次码的测试）。
 
 ## shadcn/ui 组件
 
@@ -55,14 +68,27 @@ npm run db:migrate:remote
 ```bash
 npx wrangler secret put LINUXDO_CLIENT_ID
 npx wrangler secret put LINUXDO_CLIENT_SECRET
+
+# 可选：要发 LDC 奖励时，填 LINUX DO Credit 商户应用的 Client ID / Secret
+npx wrangler secret put LDC_CLIENT_ID
+npx wrangler secret put LDC_CLIENT_SECRET
 ```
+
+可选：要不用 LinuxDO 也能登录试网站，设一个测试账号密码（自己想一个长一点的）：
+
+```bash
+npx wrangler secret put TEST_LOGIN_SECRET
+```
+
+设好后登录按钮旁会出现「测试账号」，输入密码可以用「测试用户」登录。它是普通账号，永远不是管理员，不能进管理页。测试账号不会收到 LDC。删掉这个机密（`npx wrangler secret delete TEST_LOGIN_SECRET`）入口就关了。
+
+接力押金用同一套 LDC 凭证收款和退款。要在 LINUX DO Credit 商户应用里把**回调地址（notify_url）**设成 `https://你的域名/api/ldc/notify`，付款成功后 LDC 会通知这个地址，网站验签、核对金额后才记为已付。
+
+没设 LDC 凭证时奖励功能不会发任何东西。设好后还要在网站「管理 → LDC 奖励」里点开启。定时任务每 10 分钟发一次到期的奖励，每笔用固定的订单号（`share-<码>` / `claim-<领取>`），重试不会重复到账。
 
 ### 4. 部署
 
-二选一：
-
-- **A. Cloudflare 云端构建（推荐，不占本机资源）**：把代码推到 GitHub，在 Cloudflare 控制台 Workers & Pages → Create → Import a repository，构建命令填 `npm run build`，部署命令填 `npx wrangler deploy`。构建时会自动装 shadcn 组件。
-- **B. 本机部署**：`npm run deploy`（先构建再 `wrangler deploy`）。
+Cloudflare Workers Builds 从 GitHub 的 main 分支构建。构建命令为 npm run build，部署命令为 npx wrangler deploy。上线前向目标 D1 数据库应用本次新增的 migrations。
 
 ### 5. 绑定自己的域名（国内访问建议做）
 
@@ -81,9 +107,7 @@ npm run dev
 ## 接口测试
 
 ```bash
-npx wrangler d1 migrations apply invite-exchange --local -c test/wrangler.test.jsonc --persist-to .wrangler-test
-npx wrangler dev -c test/wrangler.test.jsonc --persist-to .wrangler-test --port 8799 --var LINUXDO_BASE:http://127.0.0.1:8800
-node test/api.test.mjs   # 另开一个终端
+npm test   # 自动起本地 wrangler dev、跑 test/api.test.mjs，跑完关掉
 ```
 
 覆盖：LinuxDO OAuth 全流程（用本地假服务）、分享去重、码对外隐藏、原子领取和并发、感谢、撤回、各项限额。
@@ -97,9 +121,23 @@ node test/api.test.mjs   # 另开一个终端
 | POST | `/api/auth/logout` | 退出 |
 | GET | `/api/me` | 当前用户和限额 |
 | GET | `/api/products` | 广场：每个产品可领数量、已送出数量 |
-| POST | `/api/codes` | 分享 `{product, codes(一行一个), note}` |
+| POST | `/api/codes` | 分享 `{product_key, codes(一行一个), note, uses?}` |
 | DELETE | `/api/codes/:id` | 撤回自己还在池里的码（码内容会清空） |
+| PATCH | `/api/codes/:id` | 多人码改剩余次数 `{remaining}` |
 | POST | `/api/claim` | 领一个 `{product_key}` |
 | POST | `/api/claims/:id/thanks` | 感谢分享者 |
-| GET | `/api/my/shared` | 我分享的（含领取人、是否感谢） |
-| GET | `/api/my/claimed` | 我领到的 |
+| POST | `/api/claims/:id/report` | 反馈码无效 `{reason}` |
+| POST | `/api/product-requests` | 申请新产品 `{name, mode, max_uses?, description?}` |
+| GET | `/api/my/product-requests` | 我的产品申请 |
+| DELETE | `/api/product-requests/:id` | 撤回待审核的申请 |
+| GET | `/api/my/shared` | 我分享的（含用的人、剩余次数、LDC 奖励） |
+| GET | `/api/my/claimed` | 我领到的（含押金状态） |
+| POST | `/api/products/:key/deposit` | 接力产品付押金，返回 LINUX DO Credit 付款链接；带 `{"queue": true}` 是没码时付排队押金 |
+| GET | `/api/my/queue` | 我在排的队（排第几）和最近排到的码 |
+| GET | `/api/products/:key/chains` | 接力链图（只有匿名头像） |
+| GET | `/api/avatars/:key` | 匿名头像 |
+| POST | `/api/claims/:id/return` | 领取人自己退还用不了的码 |
+| GET | `/api/ldc/notify` | LINUX DO Credit 付款成功回调（验签） |
+| GET | `/api/my/deposits` | 我的押金 |
+| POST | `/api/deposits/:id/refund` | 退回还没用上的押金 |
+| * | `/api/admin/*` | 管理员：产品、产品申请、所有码、用户、无效反馈、LDC 设置和发放记录、接力押金 |

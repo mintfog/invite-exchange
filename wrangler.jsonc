@@ -9,7 +9,7 @@
   "workers_dev": false,
   "preview_urls": false,
   "keep_vars": true,
-  "triggers": { "crons": ["0 19 * * *"] },
+  "triggers": { "crons": ["0 19 * * *", "*/10 * * * *"] },
   "assets": {
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*"]
@@ -30,8 +30,11 @@
     // 每人 24 小时内最多分享几个码
     "MAX_SHARES_PER_DAY": "30",
     "LINUXDO_BASE": "https://connect.linux.do",
-    "DEV_LOGIN": "0"
+    "ADMIN_USERNAMES": "codeover",
+    "DEV_LOGIN": "0",
+    "LDC_BASE": "https://credit.linux.do"
   }
   // 机密不要写在这里，用 wrangler secret put：
   //   LINUXDO_CLIENT_ID, LINUXDO_CLIENT_SECRET
+  //   LDC_CLIENT_ID, LDC_CLIENT_SECRET（LINUX DO Credit 商户凭证，不设就不发 LDC）
 }

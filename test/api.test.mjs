@@ -2,6 +2,7 @@
 // 先跑：npx wrangler dev -c test/wrangler.test.jsonc --port 8799 --var LINUXDO_BASE:http://127.0.0.1:8800
 // 脚本会自己在 8800 端口起一个假的 LinuxDO OAuth 服务。
 import http from 'node:http'
+import { createHash } from 'node:crypto'
 import assert from 'node:assert/strict'
 
 const BASE = process.env.BASE ?? 'http://127.0.0.1:8799'
@@ -18,10 +19,45 @@ const fakeUsers = {
   'code-silenced': { id: 1002, username: 'bad_user', trust_level: 2, active: true, silenced: true },
 }
 const tokens = {}
+// 假 LINUX DO Credit：只记录请求，不会发出真的 LDC
+const ldcCalls = []
+const ldcSeen = new Set()
+const refundCalls = []
+// 和 worker 里一样的易支付签名
+const epaySign = (params, secret) =>
+  createHash('md5')
+    .update(
+      Object.keys(params)
+        .filter((k) => params[k] !== '' && k !== 'sign' && k !== 'sign_type')
+        .sort()
+        .map((k) => `${k}=${params[k]}`)
+        .join('&') + secret,
+    )
+    .digest('hex')
 const mock = http.createServer((req, res) => {
   let body = ''
   req.on('data', (d) => (body += d))
   req.on('end', () => {
+    if (req.url === '/lpay/distribute' && req.method === 'POST') {
+      const send = (status, obj) => res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(obj))
+      if (req.headers.authorization !== 'Basic ' + Buffer.from('ldc-test:ldc-secret').toString('base64')) {
+        return send(401, { error_msg: '凭证不对' })
+      }
+      const b = JSON.parse(body)
+      if (ldcSeen.has(b.out_trade_no)) return send(400, { error_msg: '订单号重复' })
+      if (b.username === 'poor') return send(400, { error_msg: '用户不存在' })
+      ldcSeen.add(b.out_trade_no)
+      ldcCalls.push(b)
+      return send(200, { error_msg: '', data: { trade_no: String(9000 + ldcCalls.length), out_trade_no: b.out_trade_no } })
+    }
+    if (req.url === '/epay/api.php' && req.method === 'POST') {
+      const p = Object.fromEntries(new URLSearchParams(body))
+      const send = (obj) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(obj))
+      if (p.act !== 'refund' || p.pid !== 'ldc-test' || p.key !== 'ldc-secret') return send({ code: -1, msg: '凭证不对' })
+      if (refundCalls.some((r) => r.trade_no === p.trade_no)) return send({ code: -1, msg: '已经退过' })
+      refundCalls.push(p)
+      return send({ code: 1, msg: '退款成功' })
+    }
     if (req.url === '/oauth2/token' && req.method === 'POST') {
       const p = new URLSearchParams(body)
       const auth = req.headers.authorization
@@ -127,135 +163,1034 @@ try {
     ok('退出登录后会话失效')
   }
 
-  console.log('分享')
   const alice = await new Client().devLogin('alice')
   const bob = await new Client().devLogin('bob')
   const newbie = await new Client().devLogin('newbie', 0)
+  const boss = await new Client().devLogin('admin')
+
+  console.log('管理员和产品')
+  {
+    assert.equal((await alice.json('/api/me')).data.user.is_admin, false)
+    assert.equal((await boss.json('/api/me')).data.user.is_admin, true)
+    ok('ADMIN_USERNAMES 里的账号是管理员，其他人不是')
+
+    assert.equal((await new Client().json('/api/admin/products', 'POST', { name: 'X' })).status, 401)
+    const denied = await alice.json('/api/admin/products', 'POST', { name: 'Muse', mode: 'multi', max_uses: 3 })
+    assert.equal(denied.status, 403)
+    assert.equal((await alice.json('/api/admin/codes')).status, 403)
+    assert.equal((await alice.json('/api/admin/users')).status, 403)
+    ok('普通用户不能建产品，也看不到管理接口')
+
+    const noProduct = await alice.json('/api/codes', 'POST', { product_key: 'muse', codes: 'X' })
+    assert.equal(noProduct.status, 404)
+    assert.equal(noProduct.data.error, 'no_product')
+    ok('用户不能分享到不存在的产品，也不会自动新建产品')
+
+    const mk = (b) => boss.json('/api/admin/products', 'POST', b)
+    assert.equal((await mk({ name: ' Muse ', mode: 'multi', max_uses: 3, description: '每人一个码，可以给 3 人用' })).status, 200)
+    assert.equal(
+      (await mk({ name: 'ChatterFly', mode: 'single', max_codes_per_user: 3, code_pattern: 'CF-[A-Z0-9]{4}' })).status,
+      200,
+    )
+    assert.equal((await mk({ name: '小豆', mode: 'single' })).status, 200)
+    assert.equal((await mk({ name: 'muse', mode: 'single' })).data.error, 'exists')
+    assert.equal((await mk({ name: 'Bad', mode: 'single', code_pattern: '([' })).data.error, 'bad_pattern')
+    assert.equal((await mk({ name: 'Bad', mode: 'multi', max_uses: 0 })).data.error, 'bad_max_uses')
+    ok('管理员能建两种模式的产品；重名、坏正则、次数不对都会被拒')
+
+    const list = (await new Client().json('/api/products')).data.products
+    const muse = list.find((p) => p.key === 'muse')
+    assert.equal(muse.name, 'Muse')
+    assert.equal(muse.mode, 'multi')
+    assert.equal(muse.max_uses, 3)
+    assert.equal(muse.available, 0)
+    ok('管理员建好的产品立刻出现在广场上，还没有码')
+  }
+
+  console.log('一次性码（ChatterFly 这类）')
   {
     const anon = new Client()
-    assert.equal((await anon.json('/api/codes', 'POST', { product: 'Muse', codes: 'X' })).status, 401)
+    assert.equal((await anon.json('/api/codes', 'POST', { product_key: 'chatterfly', codes: 'CF-AAAA' })).status, 401)
     ok('没登录不能分享')
 
     const noOrigin = await alice.raw('/api/codes', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ product: 'Muse', codes: 'X' }),
+      body: JSON.stringify({ product_key: 'chatterfly', codes: 'CF-AAAA' }),
     })
     assert.equal(noOrigin.status, 403)
     ok('跨站请求（没有同源 Origin）被拒绝')
 
-    const r = await alice.json('/api/codes', 'POST', { product: '  Muse ', codes: 'MUSE-1\nMUSE-2\nMUSE-2\n\nMUSE-3', note: '选中国区' })
+    const badFmt = await alice.json('/api/codes', 'POST', { product_key: 'chatterfly', codes: 'CF-AAAA\nhello' })
+    assert.equal(badFmt.data.error, 'bad_format')
+    ok('不符合产品格式的码放不进去')
+
+    const r = await alice.json('/api/codes', 'POST', {
+      product_key: 'chatterfly',
+      codes: 'CF-0001\nCF-0002\nCF-0002\n\nCF-0003',
+      note: '选中国区',
+    })
     assert.equal(r.status, 200)
     assert.equal(r.data.added, 3)
     ok('一次分享多个码，重复行自动去掉')
 
-    const dup = await bob.json('/api/codes', 'POST', { product: 'muse', codes: 'MUSE-1\nMUSE-B1' })
+    const over = await alice.json('/api/codes', 'POST', { product_key: 'chatterfly', codes: 'CF-0004' })
+    assert.equal(over.data.error, 'code_limit')
+    ok('每人最多放 3 个码，第 4 个被拒')
+
+    const dup = await bob.json('/api/codes', 'POST', { product_key: 'chatterfly', codes: 'CF-0001\nCF-B001' })
     assert.equal(dup.data.added, 1)
     assert.equal(dup.data.duplicates, 1)
-    ok('产品名大小写/空格不同也归到同一个码池；已在池里的码不能重复放')
+    ok('每个码唯一：别人已经放过的码不能重复放')
 
     const list = await new Client().json('/api/products')
-    const muse = list.data.products.find((p) => p.key === 'muse')
-    assert.equal(muse.name, 'Muse')
-    assert.equal(muse.available, 4)
-    assert.ok(!JSON.stringify(list.data).includes('MUSE-1'))
+    const cf = list.data.products.find((p) => p.key === 'chatterfly')
+    assert.equal(cf.available, 4)
+    assert.ok(!JSON.stringify(list.data).includes('CF-0001'))
     ok('广场只显示产品名和数量，看不到码本身')
-  }
 
-  console.log('领取')
-  {
-    const low = await newbie.json('/api/claim', 'POST', { product_key: 'muse' })
+    const low = await newbie.json('/api/claim', 'POST', { product_key: 'chatterfly' })
     assert.equal(low.status, 403)
     assert.equal(low.data.error, 'trust_level')
     ok('信任等级不够不能领')
 
-    const r = await bob.json('/api/claim', 'POST', { product_key: 'muse' })
-    assert.equal(r.status, 200)
-    assert.match(r.data.claim.code, /^MUSE-[123]$/)
+    const got = await bob.json('/api/claim', 'POST', { product_key: 'chatterfly' })
+    assert.equal(got.status, 200)
+    assert.match(got.data.claim.code, /^CF-000[123]$/)
+    assert.equal(got.data.claim.sharer_username, 'alice')
     ok('bob 领到的是 alice 的码，不会领到自己的')
-    const bobCode = r.data.claim.code
+    const bobCode = got.data.claim.code
 
-    const again = await bob.json('/api/claim', 'POST', { product_key: 'muse' })
+    const again = await bob.json('/api/claim', 'POST', { product_key: 'chatterfly' })
     assert.equal(again.data.error, 'already_claimed')
     ok('同一个产品每人只能领一个')
 
     const shared = await alice.json('/api/my/shared')
     const row = shared.data.codes.find((c) => c.code === bobCode)
     assert.equal(row.status, 'claimed')
-    assert.equal(row.claimer_username, 'bob')
+    assert.equal(row.used, 1)
+    const who = shared.data.claimers.find((x) => x.code_id === row.id)
+    assert.equal(who.username, 'bob')
     assert.equal(shared.data.summary.claimed, 1)
-    ok('分享者能看到码被谁领走')
+    ok('一次性码被领走就用完了，分享者能看到是谁领的')
 
     const claimed = await bob.json('/api/my/claimed')
     const cl = claimed.data.claims[0]
     assert.equal(cl.code, bobCode)
     assert.equal(cl.sharer_username, 'alice')
     assert.equal(cl.note, '选中国区')
-    const th = await bob.json(`/api/claims/${cl.id}/thanks`, 'POST')
-    assert.equal(th.status, 200)
-    const th2 = await bob.json(`/api/claims/${cl.id}/thanks`, 'POST')
-    assert.equal(th2.status, 409)
+    assert.equal((await bob.json(`/api/claims/${cl.id}/thanks`, 'POST')).status, 200)
+    assert.equal((await bob.json(`/api/claims/${cl.id}/thanks`, 'POST')).status, 409)
     const shared2 = await alice.json('/api/my/shared')
     assert.equal(shared2.data.summary.thanks, 1)
     ok('领取人可以感谢一次，分享者看到感谢数 +1')
 
     const carol = await new Client().devLogin('carol')
-    const steal = await carol.json(`/api/claims/${cl.id}/thanks`, 'POST')
-    assert.equal(steal.status, 409)
+    assert.equal((await carol.json(`/api/claims/${cl.id}/thanks`, 'POST')).status, 409)
     ok('别人不能替领取人点感谢')
 
     const avail = shared2.data.codes.find((c) => c.status === 'available')
     assert.equal((await bob.json(`/api/codes/${avail.id}`, 'DELETE')).status, 409)
     assert.equal((await alice.json(`/api/codes/${avail.id}`, 'DELETE')).status, 200)
     assert.equal((await alice.json(`/api/codes/${row.id}`, 'DELETE')).status, 409)
-    ok('只能撤回自己还在池里的码，已领走的不能撤回')
+    ok('只能撤回自己还在池里的码，已用完的不能撤回')
 
-    const onlyMine = await alice.json('/api/claim', 'POST', { product_key: 'muse' })
-    assert.equal(onlyMine.status, 200) // 池里还有 bob 的 MUSE-B1
-    const empty = await alice.json('/api/claim', 'POST', { product_key: 'muse' })
-    assert.equal(empty.data.error, 'already_claimed')
+    const room = await alice.json('/api/codes', 'POST', { product_key: 'chatterfly', codes: 'CF-0004' })
+    assert.equal(room.data.added, 1)
+    ok('撤回之后名额空出来，可以再放一个')
   }
 
-  console.log('并发：20 个人同时抢 5 个码')
+  console.log('多人可用码（Muse 这类）')
+  {
+    const two = await alice.json('/api/codes', 'POST', { product_key: 'muse', codes: 'MUSE-A\nMUSE-A2' })
+    assert.equal(two.data.error, 'one_code')
+    const tooMany = await alice.json('/api/codes', 'POST', { product_key: 'muse', codes: 'MUSE-A', uses: 4 })
+    assert.equal(tooMany.data.error, 'bad_uses')
+    ok('每人只能放一个码，可用次数不能超过产品上限')
+
+    assert.equal((await alice.json('/api/codes', 'POST', { product_key: 'muse', codes: 'MUSE-A' })).data.added, 1)
+    assert.equal((await bob.json('/api/codes', 'POST', { product_key: 'muse', codes: 'MUSE-B', uses: 2 })).data.added, 1)
+    const second = await alice.json('/api/codes', 'POST', { product_key: 'muse', codes: 'MUSE-A3' })
+    assert.equal(second.data.error, 'has_code')
+    ok('分享过一个码之后不能再放第二个')
+
+    let muse = (await new Client().json('/api/products')).data.products.find((p) => p.key === 'muse')
+    assert.equal(muse.available, 5)
+    assert.equal(muse.available_codes, 2)
+    ok('广场显示剩余可用次数（3 + 2 = 5）')
+
+    const users = await Promise.all(['m1', 'm2', 'm3', 'm4', 'm5', 'm6'].map((u) => new Client().devLogin(u)))
+    const codes = []
+    for (const u of users.slice(0, 4)) {
+      const r = await u.json('/api/claim', 'POST', { product_key: 'muse' })
+      assert.equal(r.status, 200)
+      codes.push(r.data.claim.code)
+    }
+    assert.equal(codes.filter((x) => x === 'MUSE-A').length, 2)
+    assert.equal(codes.filter((x) => x === 'MUSE-B').length, 2)
+    ok('随机轮流发：4 个人领，两个分享者各被用 2 次')
+
+    const sharedA = await alice.json('/api/my/shared')
+    const a = sharedA.data.codes.find((c) => c.code === 'MUSE-A')
+    assert.equal(a.max_uses - a.used, 1)
+    assert.equal(a.status, 'available')
+    assert.equal(sharedA.data.claimers.filter((x) => x.code_id === a.id).length, 2)
+    const sharedB = await bob.json('/api/my/shared')
+    const b = sharedB.data.codes.find((c) => c.code === 'MUSE-B')
+    assert.equal(b.status, 'claimed')
+    ok('分享者看到剩余次数和每个用了码的人；用满的码自动标为用完')
+
+    const r5 = await users[4].json('/api/claim', 'POST', { product_key: 'muse' })
+    assert.equal(r5.data.claim.code, 'MUSE-A')
+    const r6 = await users[5].json('/api/claim', 'POST', { product_key: 'muse' })
+    assert.equal(r6.data.error, 'empty')
+    ok('次数用完后不再发出')
+
+    assert.equal((await bob.json(`/api/codes/${b.id}`, 'PATCH', { remaining: 1 })).status, 200)
+    assert.equal((await bob.json(`/api/codes/${b.id}`, 'PATCH', { remaining: 99 })).data.error, 'bad_uses')
+    assert.equal((await alice.json(`/api/codes/${b.id}`, 'PATCH', { remaining: 1 })).status, 404)
+    muse = (await new Client().json('/api/products')).data.products.find((p) => p.key === 'muse')
+    assert.equal(muse.available, 1) // 产品上限 3，bob 已被用 2 次，最多还能剩 1 次
+    const r7 = await users[5].json('/api/claim', 'POST', { product_key: 'muse' })
+    assert.equal(r7.data.claim.code, 'MUSE-B')
+    ok('分享者可以改剩余次数（不超过产品上限），改完又能被领')
+
+    const one = (await alice.json('/api/my/shared')).data.codes.find((c) => c.code === 'MUSE-A')
+    assert.equal((await alice.json(`/api/codes/${one.id}`, 'PATCH', { remaining: 0 })).status, 200)
+    const cfList = await alice.json('/api/my/shared')
+    assert.equal(cfList.data.codes.find((c) => c.id === one.id).status, 'claimed')
+    ok('剩余次数改成 0 就不再发出')
+
+    const multiWd = await boss.json('/api/admin/products', 'POST', { name: 'Gamma', mode: 'multi', max_uses: 5 })
+    assert.equal(multiWd.status, 200)
+    await alice.json('/api/codes', 'POST', { product_key: 'gamma', codes: 'GAMMA-1' })
+    const g = await users[0].json('/api/claim', 'POST', { product_key: 'gamma' })
+    const gid = (await alice.json('/api/my/shared')).data.codes.find((c) => c.code === 'GAMMA-1').id
+    assert.equal((await alice.json(`/api/codes/${gid}`, 'DELETE')).status, 200)
+    const still = (await users[0].json('/api/my/claimed')).data.claims.find((c) => c.id === g.data.claim.id)
+    assert.equal(still.code, 'GAMMA-1')
+    ok('多人码用了一部分也能撤回，已经领到的人还能看到码')
+  }
+
+  console.log('管理员视图')
+  {
+    const all = await boss.json('/api/admin/codes')
+    assert.equal(all.status, 200)
+    assert.ok(all.data.codes.some((c) => c.code === 'MUSE-B' && c.sharer_username === 'bob'))
+    const onlyAlice = await boss.json('/api/admin/codes?q=alice')
+    assert.ok(onlyAlice.data.codes.length > 0 && onlyAlice.data.codes.every((c) => c.sharer_username === 'alice'))
+    ok('管理员能看到所有人分享的码，并按用户或码搜索')
+
+    const us = await boss.json('/api/admin/users')
+    const al = us.data.users.find((u) => u.username === 'alice')
+    assert.ok(al.codes >= 1 && al.given >= 1)
+    assert.equal(us.data.users.find((u) => u.username === 'admin').is_admin, true)
+    ok('管理员能看到所有注册用户和他们的分享、领取数')
+
+    const target = all.data.codes.find((c) => c.code === 'CF-B001')
+    assert.equal((await boss.json(`/api/admin/codes/${target.id}`, 'DELETE')).status, 200)
+    assert.ok(!(await boss.json('/api/admin/codes')).data.codes.some((c) => c.code === 'CF-B001'))
+    ok('管理员可以下架任何人的码')
+
+    assert.equal((await boss.json('/api/admin/products/xiaodou', 'PATCH', { active: false })).status, 404)
+    assert.equal((await boss.json('/api/admin/products/小豆', 'PATCH', { active: false })).status, 200)
+    assert.ok(!(await new Client().json('/api/products')).data.products.some((p) => p.key === '小豆'))
+    assert.equal((await alice.json('/api/codes', 'POST', { product_key: '小豆', codes: 'X' })).data.error, 'no_product')
+    assert.equal((await boss.json('/api/admin/products/小豆', 'PATCH', { active: true })).status, 200)
+    ok('管理员可以下架产品，下架后广场不显示、不能分享')
+
+    const locked = await boss.json('/api/admin/products/muse', 'PATCH', { mode: 'single' })
+    assert.equal(locked.data.error, 'mode_locked')
+    assert.equal((await boss.json('/api/admin/products/muse', 'PATCH', { description: '新说明' })).status, 200)
+    ok('已有码的产品不能改模式，其他设置可以改')
+  }
+
+  console.log('并发：20 个人同时抢')
   {
     const sharer = await new Client().devLogin('sharer')
-    await sharer.json('/api/codes', 'POST', { product: '小豆', codes: ['XD-1', 'XD-2', 'XD-3', 'XD-4', 'XD-5'].join('\n') })
+    await sharer.json('/api/codes', 'POST', { product_key: '小豆', codes: ['XD-1', 'XD-2', 'XD-3', 'XD-4', 'XD-5'].join('\n') })
     const people = await Promise.all(Array.from({ length: 20 }, (_, i) => new Client().devLogin(`racer${i}`)))
     const results = await Promise.all(people.map((p) => p.json('/api/claim', 'POST', { product_key: '小豆' })))
     const wins = results.filter((r) => r.status === 200).map((r) => r.data.claim.code)
     assert.equal(wins.length, 5)
     assert.equal(new Set(wins).size, 5)
     assert.ok(results.filter((r) => r.status !== 200).every((r) => r.data.error === 'empty'))
-    ok('正好 5 人领到，5 个码互不相同，其余 15 人提示已领完')
+    ok('一次性码：正好 5 人领到，5 个码互不相同，其余 15 人提示已领完')
 
-    const p = (await new Client().json('/api/products')).data.products.find((x) => x.key === '小豆')
-    assert.equal(p.available, 0)
-    assert.equal(p.claimed, 5)
-    ok('领完后广场显示 0 可领')
+    await boss.json('/api/admin/products', 'POST', { name: 'Delta', mode: 'multi', max_uses: 5 })
+    await sharer.json('/api/codes', 'POST', { product_key: 'delta', codes: 'DELTA-1' })
+    const r2 = await Promise.all(people.map((p) => p.json('/api/claim', 'POST', { product_key: 'delta' })))
+    assert.equal(r2.filter((r) => r.status === 200).length, 5)
+    const d = (await sharer.json('/api/my/shared')).data.codes.find((c) => c.code === 'DELTA-1')
+    assert.equal(d.used, 5)
+    assert.equal(d.status, 'claimed')
+    ok('多人码：可用 5 次，20 人同时抢正好 5 人拿到，不会超发')
   }
 
   console.log('防刷')
   {
+    for (const n of ['Bulk', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6']) {
+      await boss.json('/api/admin/products', 'POST', { name: n, mode: 'single' })
+    }
     const sh = await new Client().devLogin('bulk')
     const codes = Array.from({ length: 20 }, (_, i) => `B-${i}`).join('\n')
-    const big = await sh.json('/api/codes', 'POST', { product: 'Bulk', codes: codes + '\nB-extra' })
+    const big = await sh.json('/api/codes', 'POST', { product_key: 'bulk', codes: codes + '\nB-extra' })
     assert.equal(big.data.error, 'too_many')
     ok('一次最多放 20 个')
-    for (const n of ['P1', 'P2', 'P3', 'P4', 'P5', 'P6']) {
-      await sh.json('/api/codes', 'POST', { product: n, codes: `${n}-a\n${n}-b` })
+    for (const n of ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']) {
+      await sh.json('/api/codes', 'POST', { product_key: n, codes: `${n}-a\n${n}-b` })
     }
-    const lim = await sh.json('/api/codes', 'POST', { product: 'Bulk', codes })
+    const lim = await sh.json('/api/codes', 'POST', { product_key: 'bulk', codes })
     assert.equal(lim.data.error, 'share_limit')
     ok('24 小时分享上限生效')
 
     const grabber = await new Client().devLogin('grabber')
     const got = []
-    for (const n of ['P1', 'P2', 'P3', 'P4', 'P5', 'P6']) {
-      got.push(await grabber.json('/api/claim', 'POST', { product_key: n.toLowerCase() }))
+    for (const n of ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']) {
+      got.push(await grabber.json('/api/claim', 'POST', { product_key: n }))
     }
     assert.equal(got.filter((r) => r.status === 200).length, 5)
     assert.equal(got[5].data.error, 'claim_limit')
     ok('24 小时领取上限（5 个）生效')
+  }
+
+  console.log('LDC 奖励（假 LDC 服务，不会真的发）')
+  {
+    assert.equal((await alice.json('/api/admin/settings')).status, 403)
+    const st = (await boss.json('/api/admin/settings')).data
+    assert.equal(st.settings.ldc_enabled, false)
+    assert.equal(st.ldc_configured, true)
+    ok('LDC 默认关闭；只有管理员能看设置')
+
+    await boss.json('/api/admin/products', 'POST', { name: 'Echo', mode: 'single' })
+    await boss.json('/api/admin/products', 'POST', { name: 'Fox', mode: 'multi', max_uses: 3 })
+    const giver = await new Client().devLogin('giver')
+    const takers = await Promise.all(Array.from({ length: 10 }, (_, i) => new Client().devLogin(`taker${i}`)))
+    const claim = async (who, key) => {
+      const r = await who.json('/api/claim', 'POST', { product_key: key })
+      assert.equal(r.status, 200, JSON.stringify(r.data))
+      return r.data.claim
+    }
+    const codeId = async (who, code) => (await who.json('/api/my/shared')).data.codes.find((c) => c.code === code).id
+    const payouts = async (status = 'all') => (await boss.json(`/api/admin/payouts?status=${status}`)).data.payouts
+    const run = async () => (await boss.json('/api/admin/payouts/run', 'POST')).data
+
+    await giver.json('/api/codes', 'POST', { product_key: 'echo', codes: 'ECHO-1' })
+    await claim(takers[0], 'echo')
+    assert.equal((await payouts()).length, 0)
+    assert.equal((await new Client().json('/api/products')).data.products.find((p) => p.key === 'echo').share_reward_cents, 0)
+    ok('关闭时领取不产生奖励，广场也不显示奖励')
+
+    assert.equal((await boss.json('/api/admin/settings', 'PUT', { claim_reward_cents: -1 })).data.error, 'bad_amount')
+    const put = await boss.json('/api/admin/settings', 'PUT', {
+      ldc_enabled: true,
+      share_reward_cents: 100,
+      claim_reward_cents: 50,
+      daily_cap_cents: 1000,
+      hold_hours: 0,
+    })
+    assert.equal(put.status, 200)
+    assert.equal((await boss.json('/api/admin/products/echo', 'PATCH', { claim_reward_cents: 'x' })).data.error, 'bad_reward')
+    assert.equal((await boss.json('/api/admin/products/echo', 'PATCH', { claim_reward_cents: 20 })).status, 200)
+    const sq = (await new Client().json('/api/products')).data.products
+    assert.deepEqual(
+      [sq.find((p) => p.key === 'echo'), sq.find((p) => p.key === 'fox')].map((p) => [p.share_reward_cents, p.claim_reward_cents]),
+      [
+        [100, 20],
+        [100, 50],
+      ],
+    )
+    ok('管理员能开启 LDC、设全站金额，单个产品可以覆盖；广场显示实际奖励')
+
+    await giver.json('/api/codes', 'POST', { product_key: 'echo', codes: 'ECHO-2' })
+    await giver.json('/api/codes', 'POST', { product_key: 'fox', codes: 'FOX-1', uses: 3 })
+    await claim(takers[1], 'echo')
+    await claim(takers[2], 'fox')
+    await claim(takers[3], 'fox')
+    const fox1 = await codeId(giver, 'FOX-1')
+    const ps = await payouts()
+    assert.equal(ps.length, 5)
+    assert.equal(ps.filter((p) => p.id === `share-${fox1}`).length, 1)
+    assert.ok(ps.every((p) => p.status === 'pending' && p.sharer_username === 'giver'))
+    ok('一次性码：贡献 + 领取各一笔；多人码：贡献奖励只记一次，每次领取一笔')
+
+    const r1 = await run()
+    assert.equal(r1.sent, 5)
+    assert.equal(ldcCalls.length, 5)
+    assert.ok(ldcCalls.every((b) => b.username === 'giver' && typeof b.user_id === 'number' && b.out_trade_no))
+    assert.deepEqual(ldcCalls.map((b) => b.amount).sort(), [0.2, 0.5, 0.5, 1, 1])
+    assert.equal((await run()).sent, 0)
+    assert.equal(ldcCalls.length, 5)
+    const mine = (await giver.json('/api/my/shared')).data
+    assert.equal(mine.summary.rewarded_cents, 320)
+    assert.equal(mine.payouts.filter((p) => p.status === 'sent').length, 5)
+    ok('到期奖励通过 LDC 分发接口发给分享者；再跑一次不会重复发；分享者能看到收到多少')
+
+    const poor = await new Client().devLogin('poor')
+    await poor.json('/api/codes', 'POST', { product_key: 'fox', codes: 'FOX-P', uses: 1 })
+    await claim(takers[4], 'fox')
+    const r2 = await run()
+    assert.equal(r2.failed, 2)
+    const failed = await payouts('failed')
+    assert.equal(failed.length, 2)
+    assert.equal(failed[0].error, '用户不存在')
+    assert.equal((await boss.json(`/api/admin/payouts/${failed[0].id}/retry`, 'POST')).status, 200)
+    assert.equal((await run()).failed, 1)
+    assert.equal((await boss.json(`/api/admin/payouts/${failed[1].id}/cancel`, 'POST')).status, 200)
+    assert.equal((await boss.json(`/api/admin/payouts/${failed[1].id}/retry`, 'POST')).data.error, 'not_retryable')
+    ok('LDC 拒绝时记为失败并显示原因，管理员可以重试或取消')
+
+    await boss.json('/api/admin/settings', 'PUT', { daily_cap_cents: 320 })
+    await giver.json('/api/codes', 'POST', { product_key: 'echo', codes: 'ECHO-3' })
+    await claim(takers[5], 'echo')
+    const r3 = await run()
+    assert.equal(r3.sent, 0)
+    assert.equal(r3.waiting, 2)
+    await boss.json('/api/admin/settings', 'PUT', { daily_cap_cents: 1000 })
+    assert.equal((await run()).sent, 2)
+    ok('超过全站 24 小时上限的先不发，调高上限后补发')
+
+    await boss.json('/api/admin/settings', 'PUT', { hold_hours: 24 })
+    await giver.json('/api/codes', 'POST', { product_key: 'echo', codes: 'ECHO-4' })
+    const c7 = await claim(takers[6], 'echo')
+    assert.equal((await run()).sent, 0)
+    const echo4 = await codeId(giver, 'ECHO-4')
+    assert.equal((await payouts('pending')).filter((p) => p.code_id === echo4).length, 2)
+    ok('观察期内不发')
+
+    assert.equal((await takers[1].json(`/api/claims/${c7.id}/report`, 'POST', {})).status, 404)
+    assert.equal((await takers[6].json(`/api/claims/${c7.id}/report`, 'POST', { reason: '提示邀请码无效' })).status, 200)
+    assert.equal((await takers[6].json(`/api/claims/${c7.id}/report`, 'POST', {})).data.error, 'already_reported')
+    assert.equal((await payouts('held')).filter((p) => p.code_id === echo4).length, 2)
+    const shared = (await giver.json('/api/my/shared')).data.codes.find((c) => c.id === echo4)
+    assert.equal(shared.reports_open, 1)
+    ok('只有领取人能反馈无效；反馈后这个码的奖励被扣下，分享者能看到有反馈')
+
+    const reports = (await boss.json('/api/admin/reports')).data.reports
+    const rep = reports.find((r) => r.code_id === echo4)
+    assert.equal(rep.reason, '提示邀请码无效')
+    assert.equal(rep.held_cents, 120)
+    assert.equal((await alice.json(`/api/admin/reports/${rep.id}/resolve`, 'POST', { action: 'confirm' })).status, 403)
+    assert.equal((await boss.json(`/api/admin/reports/${rep.id}/resolve`, 'POST', { action: 'confirm' })).status, 200)
+    assert.equal((await payouts('canceled')).filter((p) => p.code_id === echo4).length, 2)
+    const myc = (await takers[6].json('/api/my/claimed')).data.claims.find((x) => x.id === c7.id)
+    assert.ok(myc.void_at)
+    assert.equal(myc.report_status, 'confirmed')
+    assert.ok(!(await giver.json('/api/my/shared')).data.codes.some((c) => c.id === echo4))
+    await giver.json('/api/codes', 'POST', { product_key: 'echo', codes: 'ECHO-5' })
+    assert.equal((await claim(takers[6], 'echo')).code, 'ECHO-5')
+    ok('管理员确认无效：撤下码、取消奖励、领取作废，反馈人可以再领一个')
+
+    const c8 = await claim(takers[7], 'fox')
+    assert.equal(c8.code, 'FOX-1')
+    await takers[7].json(`/api/claims/${c8.id}/report`, 'POST', { reason: '不确定' })
+    const rep2 = (await boss.json('/api/admin/reports')).data.reports.find((r) => r.claim_id === c8.id)
+    assert.equal((await boss.json(`/api/admin/reports/${rep2.id}/resolve`, 'POST', { action: 'dismiss' })).status, 200)
+    assert.equal((await payouts('pending')).filter((p) => p.code_id === fox1).length, 1)
+    ok('管理员驳回反馈：扣下的奖励恢复待发')
+
+    assert.equal((await boss.json(`/api/admin/codes/${fox1}`, 'DELETE')).status, 200)
+    assert.equal((await payouts('pending')).filter((p) => p.code_id === fox1).length, 0)
+    ok('管理员撤下码时，没发的奖励一起取消')
+
+    await boss.json('/api/admin/settings', 'PUT', { ldc_enabled: false, hold_hours: 0 })
+    const before = ldcCalls.length
+    await giver.json('/api/codes', 'POST', { product_key: 'echo', codes: 'ECHO-6' })
+    await claim(takers[8], 'echo')
+    assert.equal((await run()).enabled, false)
+    assert.equal(ldcCalls.length, before)
+    ok('关闭后既不记新奖励也不发')
+  }
+
+  console.log('测试账号')
+  {
+    const anon = new Client()
+    assert.equal((await anon.json('/api/me')).data.test_login, true)
+    const bad = await anon.json('/api/auth/test-login', 'POST', { password: 'nope' })
+    assert.equal(bad.status, 403)
+    assert.equal((await anon.json('/api/me')).data.user, null)
+    ok('密码不对不能登录测试账号')
+
+    const tu = new Client()
+    assert.equal((await tu.json('/api/auth/test-login', 'POST', { password: 'test-pass' })).status, 200)
+    const me2 = (await tu.json('/api/me')).data.user
+    assert.equal(me2.username, '测试用户')
+    assert.equal(me2.is_admin, false)
+    assert.equal((await tu.json('/api/admin/settings')).status, 403)
+    assert.equal((await tu.json('/api/admin/users')).status, 403)
+    // 以前的 account: 'admin' 参数不再有用，还是普通测试用户
+    const ta = new Client()
+    await ta.json('/api/auth/test-login', 'POST', { password: 'test-pass', account: 'admin' })
+    const me = (await ta.json('/api/me')).data.user
+    assert.equal(me.username, '测试用户')
+    assert.equal(me.is_admin, false)
+    ok('测试账号只有一个普通用户，进不了管理页')
+
+    const users = (await boss.json('/api/admin/users')).data.users
+    assert.ok(users.find((u) => u.username === '测试用户').is_test)
+    assert.ok(!users.some((u) => u.username === '测试管理员'))
+    ok('管理页的用户列表标出测试账号')
+
+    await boss.json('/api/admin/settings', 'PUT', { ldc_enabled: true, hold_hours: 0 })
+    await tu.json('/api/codes', 'POST', { product_key: 'echo', codes: 'ECHO-T' })
+    const t9 = await new Client().devLogin('taker9')
+    assert.equal((await t9.json('/api/claim', 'POST', { product_key: 'echo' })).data.claim.code, 'ECHO-T')
+    const tid = (await tu.json('/api/my/shared')).data.codes.find((c) => c.code === 'ECHO-T').id
+    assert.equal((await boss.json('/api/admin/payouts')).data.payouts.filter((p) => p.code_id === tid).length, 0)
+    await boss.json('/api/admin/settings', 'PUT', { ldc_enabled: false })
+    ok('测试账号分享的码被领取，不会记 LDC 奖励')
+  }
+
+  console.log('立即发放（跳过观察期）')
+  {
+    await boss.json('/api/admin/products', 'POST', { name: 'Quick', mode: 'single' })
+    await boss.json('/api/admin/settings', 'PUT', {
+      ldc_enabled: true,
+      share_reward_cents: 100,
+      claim_reward_cents: 0,
+      daily_cap_cents: 1_000_000,
+      hold_hours: 24,
+    })
+    const vip = await new Client().devLogin('vip')
+    const other = await new Client().devLogin('other-sharer')
+    const vipId = (await vip.json('/api/me')).data.user.id
+    const shareRes = await vip.json('/api/codes', 'POST', { product_key: 'quick', codes: 'G-1\nG-2\nG-3' })
+    assert.equal(shareRes.status, 200, JSON.stringify(shareRes.data))
+    for (let i = 0; i < 3; i++) {
+      const r = await (await new Client().devLogin(`gtaker${i}`)).json('/api/claim', 'POST', { product_key: 'quick' })
+      assert.equal(r.status, 200, JSON.stringify(r.data))
+    }
+    await other.json('/api/codes', 'POST', { product_key: 'quick', codes: 'G-9' })
+    await (await new Client().devLogin('gtaker9')).json('/api/claim', 'POST', { product_key: 'quick' })
+    const list = async () =>
+      (await boss.json('/api/admin/payouts')).data.payouts.filter((p) => p.product === 'Quick')
+    const vipPayouts = (await list()).filter((p) => p.sharer_username === 'vip')
+    assert.equal(vipPayouts.length, 3)
+    assert.ok(vipPayouts.every((p) => p.status === 'pending' && p.due_at > Date.now() + 23 * 3600 * 1000))
+    const before = ldcCalls.length
+    await boss.json('/api/admin/payouts/run', 'POST')
+    assert.equal(ldcCalls.length, before)
+    ok('观察期 24 小时内，普通发放不会发')
+
+    assert.equal((await vip.json(`/api/admin/payouts/${vipPayouts[0].id}/send-now`, 'POST')).status, 403)
+    const one = await boss.json(`/api/admin/payouts/${vipPayouts[0].id}/send-now`, 'POST')
+    assert.equal(one.status, 200)
+    assert.equal(one.data.sent, 1)
+    assert.equal(ldcCalls.length, before + 1)
+    assert.equal(ldcCalls.at(-1).out_trade_no, vipPayouts[0].id)
+    assert.equal((await boss.json(`/api/admin/payouts/${vipPayouts[0].id}/send-now`, 'POST')).status, 409)
+    ok('管理员对单笔立即发放：马上发出，只发这一笔，发过的不能再发')
+
+    const users = (await boss.json('/api/admin/users')).data.users
+    const vu = users.find((u) => u.username === 'vip')
+    assert.equal(vu.unpaid_cents, 200)
+    assert.equal(vu.sent_cents, 100)
+    const all = await boss.json(`/api/admin/users/${vipId}/send-now`, 'POST')
+    assert.equal(all.status, 200)
+    assert.equal(all.data.sent, 2)
+    assert.equal(ldcCalls.length, before + 3)
+    assert.ok(ldcCalls.slice(before).every((b) => b.username === 'vip'))
+    const otherP = (await list()).find((p) => p.sharer_username === 'other-sharer')
+    assert.equal(otherP.status, 'pending')
+    assert.equal((await boss.json(`/api/admin/users/${vipId}/send-now`, 'POST')).status, 404)
+    ok('管理员对某个用户立即发放：发完他所有待发的奖励，别人的不受影响')
+
+    // 有人反馈无效的不能立即发
+    const gclaim = (await (await new Client().devLogin('gtaker9')).json('/api/my/claimed')).data.claims[0]
+    const g9 = await new Client().devLogin('gtaker9')
+    await g9.json(`/api/claims/${gclaim.id}/report`, 'POST', { reason: '不能用' })
+    const held = await boss.json(`/api/admin/payouts/${otherP.id}/send-now`, 'POST')
+    assert.equal(held.status, 409)
+    assert.equal(held.data.error, 'held')
+    ok('有人反馈无效、被扣下的奖励不能立即发')
+
+    await boss.json('/api/admin/settings', 'PUT', { ldc_enabled: false })
+    const off = await boss.json(`/api/admin/users/${vipId}/send-now`, 'POST')
+    assert.equal(off.status, 409)
+    assert.equal(off.data.error, 'ldc_disabled')
+    ok('LDC 奖励关闭时不能立即发放')
+  }
+
+  console.log('申请新产品')
+  {
+    const pr = await new Client().devLogin('requester')
+    const pr2 = await new Client().devLogin('requester2')
+    assert.equal((await new Client().json('/api/product-requests', 'POST', { name: 'Zed' })).status, 401)
+    assert.equal((await pr.json('/api/product-requests', 'POST', { name: '' })).status, 400)
+    const dup = await pr.json('/api/product-requests', 'POST', { name: 'echo' })
+    assert.equal(dup.status, 409)
+    assert.equal(dup.data.error, 'exists')
+    ok('没登录不能申请；广场上已有的产品不能再申请')
+
+    const a = await pr.json('/api/product-requests', 'POST', {
+      name: ' Zed  AI ',
+      mode: 'multi',
+      max_uses: 10,
+      description: '注册时填码，双方都加额度',
+    })
+    assert.equal(a.status, 200)
+    const same = await pr2.json('/api/product-requests', 'POST', { name: 'zed ai' })
+    assert.equal(same.status, 409)
+    assert.equal(same.data.error, 'already_requested')
+    ok('提交申请；同一个产品同时只能有一条待审核')
+
+    await pr.json('/api/product-requests', 'POST', { name: 'Req B' })
+    await pr.json('/api/product-requests', 'POST', { name: 'Req C' })
+    const over = await pr.json('/api/product-requests', 'POST', { name: 'Req D' })
+    assert.equal(over.status, 429)
+    ok('每人同时最多 3 条待审核')
+
+    const mine = (await pr.json('/api/my/product-requests')).data.requests
+    assert.equal(mine.length, 3)
+    assert.equal(mine.find((r) => r.id === a.data.id).name, 'Zed AI')
+    const c = mine.find((r) => r.name === 'Req C')
+    assert.equal((await pr2.json(`/api/product-requests/${c.id}`, 'DELETE')).status, 404)
+    assert.equal((await pr.json(`/api/product-requests/${c.id}`, 'DELETE')).status, 200)
+    assert.equal((await pr.json('/api/product-requests', 'POST', { name: 'Req D' })).status, 200)
+    ok('申请人能看到自己的申请，能撤回，别人撤不了')
+
+    assert.equal((await pr.json('/api/admin/product-requests')).status, 403)
+    const pending = (await boss.json('/api/admin/product-requests')).data.requests
+    assert.ok(pending.some((r) => r.id === a.data.id && r.username === 'requester'))
+    assert.equal((await pr.json(`/api/admin/product-requests/${a.data.id}/approve`, 'POST', {})).status, 403)
+    ok('只有管理员能看和审核申请')
+
+    const ok1 = await boss.json(`/api/admin/product-requests/${a.data.id}/approve`, 'POST', {
+      admin_note: '已上架',
+      share_reward_cents: 200,
+    })
+    assert.equal(ok1.status, 200)
+    const prods = (await pr.json('/api/products')).data.products
+    const zed = prods.find((p) => p.key === ok1.data.key)
+    assert.equal(zed.name, 'Zed AI')
+    assert.equal(zed.mode, 'multi')
+    assert.equal(zed.max_uses, 10)
+    const again = await boss.json(`/api/admin/product-requests/${a.data.id}/approve`, 'POST', {})
+    assert.equal(again.status, 404)
+    const mine2 = (await pr.json('/api/my/product-requests')).data.requests
+    const done = mine2.find((r) => r.id === a.data.id)
+    assert.equal(done.status, 'approved')
+    assert.equal(done.admin_note, '已上架')
+    ok('管理员通过：按申请建好产品（多人可用、10 次），可以改设置，申请人看到已通过')
+
+    const b = mine2.find((r) => r.name === 'Req B')
+    assert.equal((await boss.json(`/api/admin/product-requests/${b.id}/reject`, 'POST', { note: '太冷门' })).status, 200)
+    const rej = (await pr.json('/api/my/product-requests')).data.requests.find((r) => r.id === b.id)
+    assert.equal(rej.status, 'rejected')
+    assert.equal(rej.admin_note, '太冷门')
+    assert.ok(!(await pr.json('/api/products')).data.products.some((p) => p.name === 'Req B'))
+    assert.equal((await pr2.json('/api/product-requests', 'POST', { name: 'Req B' })).status, 200)
+    ok('管理员拒绝：不建产品，申请人看到理由；拒绝后别人可以再申请')
+  }
+
+  console.log('接力押金（假 LDC 服务，不会真的扣款退款）')
+  {
+    await boss.json('/api/admin/settings', 'PUT', { relay_enabled: true, relay_deposit_cents: 300, hold_hours: 0 })
+    assert.equal((await boss.json('/api/admin/products', 'POST', { name: 'Relay', mode: 'single', relay_required: true })).status, 200)
+    const s0 = await new Client().devLogin('relay0')
+    const r1 = await new Client().devLogin('relay1')
+    const r2 = await new Client().devLogin('relay2')
+    const r3 = await new Client().devLogin('relay3')
+    const r4 = await new Client().devLogin('relay4')
+    const key = (await r1.json('/api/products')).data.products.find((p) => p.name === 'Relay').key
+    assert.equal((await s0.json('/api/codes', 'POST', { product_key: key, codes: 'RELAY-0' })).status, 200)
+    const prod = (await r1.json('/api/products')).data.products.find((p) => p.key === key)
+    assert.equal(prod.deposit_cents, 300)
+    assert.equal(prod.has_deposit, 0)
+    const noDep = await r1.json('/api/claim', 'POST', { product_key: key })
+    assert.equal(noDep.status, 402)
+    assert.equal(noDep.data.error, 'deposit_required')
+    assert.equal((await r1.json('/api/products/quick/deposit', 'POST')).status, 409)
+    ok('要接力的产品：没付押金不能领，不要接力的产品不收押金')
+
+    // 付押金：拿到 LDC 付款链接，模拟 LDC 回调
+    const pay = async (cl) => {
+      const r = await cl.json(`/api/products/${key}/deposit`, 'POST')
+      assert.equal(r.status, 200, JSON.stringify(r.data))
+      const u = new URL(r.data.url)
+      assert.equal(u.pathname, '/epay/pay/submit.php')
+      const q = Object.fromEntries(u.searchParams)
+      assert.equal(q.money, '3.00')
+      assert.equal(q.pid, 'ldc-test')
+      assert.equal(q.sign, epaySign(q, 'ldc-secret'))
+      return q
+    }
+    const notify = (q, extra = {}) => {
+      const n = { pid: q.pid, trade_no: `T-${q.out_trade_no}`, out_trade_no: q.out_trade_no, type: 'epay', name: q.name, money: q.money, trade_status: 'TRADE_SUCCESS', ...extra }
+      n.sign_type = 'MD5'
+      n.sign = extra.sign ?? epaySign(n, 'ldc-secret')
+      return fetch(`${BASE}/api/ldc/notify?${new URLSearchParams(n)}`)
+    }
+    const q1 = await pay(r1)
+    assert.equal((await notify(q1, { sign: 'bad' })).status, 400)
+    assert.equal((await notify(q1, { money: '0.01' })).status, 400)
+    assert.equal((await r1.json('/api/claim', 'POST', { product_key: key })).status, 402)
+    const okN = await notify(q1)
+    assert.equal(okN.status, 200)
+    assert.equal(await okN.text(), 'success')
+    assert.equal(await (await notify(q1)).text(), 'success')
+    assert.equal((await r1.json('/api/my/deposits')).data.deposits.length, 1)
+    assert.equal((await r1.json(`/api/products/${key}/deposit`, 'POST')).data.error, 'has_deposit')
+    ok('付押金：签名正确、金额对得上才记为已付，重复回调不重复记')
+
+    const c1 = await r1.json('/api/claim', 'POST', { product_key: key })
+    assert.equal(c1.status, 200, JSON.stringify(c1.data))
+    assert.equal(c1.data.claim.deposit_cents, 300)
+    let mine = (await r1.json('/api/my/claimed')).data.claims.find((x) => x.product_key === key || x.code === 'RELAY-0')
+    assert.equal(mine.deposit_status, 'used')
+    assert.equal(mine.relayed, 0)
+    const waiting = (await r2.json('/api/products')).data.products.find((p) => p.key === key)
+    assert.equal(waiting.available, 0)
+    assert.equal(waiting.waiting_relays, 1)
+    const sh1 = await r1.json('/api/codes', 'POST', { product_key: key, codes: 'RELAY-1' })
+    assert.equal(sh1.data.relayed, 1)
+    ok('付了押金就能领；领到后放回自己的码，记为接力')
+
+    assert.equal((await r2.json('/api/products')).data.products.find((p) => p.key === key).waiting_relays, 0)
+    const before = refundCalls.length
+    await boss.json('/api/admin/deposits/run', 'POST')
+    assert.equal(refundCalls.length, before)
+    await notify(await pay(r2))
+    const c2 = await r2.json('/api/claim', 'POST', { product_key: key })
+    assert.equal(c2.data.claim.code, 'RELAY-1')
+    assert.equal((await r1.json('/api/my/deposits')).data.deposits[0].status, 'refund_due')
+    const run = await boss.json('/api/admin/deposits/run', 'POST')
+    assert.equal(run.data.refunded, 1)
+    assert.equal(refundCalls.length, before + 1)
+    assert.equal(refundCalls.at(-1).trade_no, `T-${q1.out_trade_no}`)
+    assert.equal(refundCalls.at(-1).money, '3.00')
+    assert.equal((await r1.json('/api/my/deposits')).data.deposits[0].status, 'refunded')
+    assert.equal((await boss.json('/api/admin/deposits/run', 'POST')).data.refunded, 0)
+    ok('放回的码被别人领走、过了观察期：押金原路退回，只退一次')
+
+    // 没用上的押金自己退；撤回接力码后押金不退
+    const sh2 = await r2.json('/api/codes', 'POST', { product_key: key, codes: 'RELAY-2' })
+    assert.equal(sh2.data.relayed, 1)
+    await notify(await pay(r3))
+    const d3 = (await r3.json('/api/my/deposits')).data.deposits[0]
+    assert.equal((await r2.json(`/api/deposits/${d3.id}/refund`, 'POST')).status, 404)
+    assert.equal((await r3.json(`/api/deposits/${d3.id}/refund`, 'POST')).status, 200)
+    assert.equal((await r3.json('/api/my/deposits')).data.deposits[0].status, 'refunded')
+    const d2 = (await r2.json('/api/my/deposits')).data.deposits[0]
+    assert.equal((await r2.json(`/api/deposits/${d2.id}/refund`, 'POST')).data.error, 'not_refundable')
+    const code2 = (await r2.json('/api/my/shared')).data.codes.find((x) => x.code === 'RELAY-2')
+    assert.equal((await r2.json(`/api/codes/${code2.id}`, 'DELETE')).status, 200)
+    assert.equal((await r2.json('/api/my/deposits')).data.deposits[0].relayed, 0)
+    ok('没用上的押金可以自己退；撤回接力码后要重新放回才能退')
+
+    // 接力的码被确认无效：领的人押金回到已付，接力的人要重新放回
+    assert.equal((await r2.json('/api/codes', 'POST', { product_key: key, codes: 'RELAY-3' })).data.relayed, 1)
+    await notify(await pay(r4))
+    const c4 = await r4.json('/api/claim', 'POST', { product_key: key })
+    assert.equal(c4.data.claim.code, 'RELAY-3')
+    assert.equal((await r2.json('/api/my/deposits')).data.deposits[0].status, 'refund_due')
+    assert.equal((await r4.json(`/api/claims/${c4.data.claim.id}/report`, 'POST', { reason: '不能用' })).status, 200)
+    const beforeR = refundCalls.length
+    await boss.json('/api/admin/deposits/run', 'POST')
+    assert.equal(refundCalls.length, beforeR)
+    const rep = (await boss.json('/api/admin/reports')).data.reports.find((x) => x.claim_id === c4.data.claim.id || x.code === 'RELAY-3')
+    assert.equal((await boss.json(`/api/admin/reports/${rep.id}/resolve`, 'POST', { action: 'confirm' })).status, 200)
+    const dep2 = (await r2.json('/api/my/deposits')).data.deposits[0]
+    assert.equal(dep2.status, 'used')
+    assert.equal(dep2.relayed, 0)
+    assert.equal((await r4.json('/api/my/deposits')).data.deposits[0].status, 'paid')
+    ok('有人反馈接力码无效、管理员确认后：押金不退，接力的人要重新放回；领到无效码的人押金回到已付')
+
+    const adm = (await boss.json('/api/admin/deposits')).data.deposits
+    assert.ok(adm.length >= 4)
+    assert.equal((await alice.json('/api/admin/deposits')).status, 403)
+    assert.equal((await boss.json(`/api/admin/deposits/${dep2.id}/forfeit`, 'POST')).status, 200)
+    assert.equal((await r2.json('/api/my/deposits')).data.deposits[0].status, 'forfeited')
+    const d4 = (await r4.json('/api/my/deposits')).data.deposits[0]
+    assert.equal((await boss.json(`/api/admin/deposits/${d4.id}/refund`, 'POST')).status, 200)
+    assert.equal((await r4.json('/api/my/deposits')).data.deposits[0].status, 'refunded')
+    ok('管理员能看所有押金、手动退回或没收')
+
+    // 接力链：A 的码被 B 领走（押金等观察期），B 放回的码又被 C 领走 → A 的押金马上退
+    await boss.json('/api/admin/settings', 'PUT', { hold_hours: 24 })
+    const chain = await mkChainProduct()
+    async function mkChainProduct() {
+      const r = await boss.json('/api/admin/products', 'POST', { name: 'Chain', mode: 'single', relay_required: true })
+      return r.data.key
+    }
+    const ca = await new Client().devLogin('chainA')
+    const cb = await new Client().devLogin('chainB')
+    const cc = await new Client().devLogin('chainC')
+    const seed = await new Client().devLogin('chain-seed')
+    await seed.json('/api/codes', 'POST', { product_key: chain, codes: 'CHAIN-0' })
+    const payFor = async (cl) => {
+      const r = await cl.json(`/api/products/${chain}/deposit`, 'POST')
+      const q = Object.fromEntries(new URL(r.data.url).searchParams)
+      await notify(q)
+      return q
+    }
+    const qa = await payFor(ca)
+    assert.equal((await ca.json('/api/claim', 'POST', { product_key: chain })).data.claim.code, 'CHAIN-0')
+    await ca.json('/api/codes', 'POST', { product_key: chain, codes: 'CHAIN-A' })
+    await payFor(cb)
+    assert.equal((await cb.json('/api/claim', 'POST', { product_key: chain })).data.claim.code, 'CHAIN-A')
+    await cb.json('/api/codes', 'POST', { product_key: chain, codes: 'CHAIN-B' })
+    const depA = async () => (await ca.json('/api/my/deposits')).data.deposits[0]
+    assert.equal((await depA()).status, 'refund_due')
+    assert.ok((await depA()).refund_due_at > Date.now() + 23 * 3600 * 1000)
+    assert.equal((await boss.json('/api/admin/deposits/run', 'POST')).data.refunded, 0)
+    await payFor(cc)
+    assert.equal((await cc.json('/api/claim', 'POST', { product_key: chain })).data.claim.code, 'CHAIN-B')
+    let a = await depA()
+    for (let i = 0; i < 20 && a.status !== 'refunded'; i++) {
+      await new Promise((r) => setTimeout(r, 100))
+      a = await depA()
+    }
+    if (a.status !== 'refunded') await boss.json('/api/admin/deposits/run', 'POST')
+    assert.equal((await depA()).status, 'refunded')
+    assert.ok(refundCalls.some((r) => r.trade_no === `T-${qa.out_trade_no}`))
+    const depB = (await cb.json('/api/my/deposits')).data.deposits[0]
+    assert.equal(depB.status, 'refund_due')
+    assert.ok(depB.refund_due_at > Date.now() + 23 * 3600 * 1000)
+    ok('接力链：B 放回的码被 C 领走，证明 A 的码有效，A 的押金不等观察期马上退；B 的还要等')
+    await boss.json('/api/admin/settings', 'PUT', { hold_hours: 0 })
+
+    // 每个产品自己的押金、最低等级、分档押金
+    const mkp = (b) => boss.json('/api/admin/products', 'POST', b)
+    assert.equal((await mkp({ name: 'Bad1', relay_required: true, deposit_cents: 0 })).data.error, 'bad_deposit')
+    assert.equal((await mkp({ name: 'Bad2', min_trust_level: 5 })).data.error, 'bad_trust_level')
+    assert.equal((await mkp({ name: 'Bad3', deposit_tiers: [{ level: 3, cents: 1 }, { level: 3, cents: 0 }] })).data.error, 'bad_tiers')
+    const tiered = await mkp({
+      name: 'Tiered',
+      relay_required: true,
+      deposit_cents: 800,
+      min_trust_level: 2,
+      deposit_tiers: [{ level: 4, cents: 0 }, { level: 3, cents: 400 }],
+    })
+    assert.equal(tiered.status, 200, JSON.stringify(tiered.data))
+    const tk = tiered.data.key
+    const ap = (await boss.json('/api/admin/products')).data.products.find((p) => p.key === tk)
+    assert.equal(ap.deposit_cents, 800)
+    assert.equal(ap.min_trust_level, 2)
+    assert.deepEqual(ap.deposit_tiers, [{ level: 3, cents: 400 }, { level: 4, cents: 0 }])
+    const tsh = await new Client().devLogin('tier-sharer', 2)
+    assert.equal((await tsh.json('/api/codes', 'POST', { product_key: tk, codes: 'TIER-A\nTIER-B\nTIER-C' })).status, 200)
+    const t1 = await new Client().devLogin('tier1', 1)
+    const t2 = await new Client().devLogin('tier2', 2)
+    const t3 = await new Client().devLogin('tier3', 3)
+    const t4 = await new Client().devLogin('tier4', 4)
+    const view = async (cl) => (await cl.json('/api/products')).data.products.find((p) => p.key === tk)
+    const v1 = await view(t1)
+    assert.equal(v1.min_trust_level, 2)
+    assert.equal(v1.deposit_base_cents, 800)
+    assert.equal((await t1.json('/api/claim', 'POST', { product_key: tk })).data.error, 'trust_level')
+    assert.equal((await t1.json(`/api/products/${tk}/deposit`, 'POST')).data.error, 'trust_level')
+    assert.equal((await view(t2)).deposit_cents, 800)
+    assert.equal((await view(t3)).deposit_cents, 400)
+    assert.equal((await view(t4)).deposit_cents, null)
+    assert.equal((await view(new Client())).deposit_cents, 800)
+    ok('产品单独的最低等级：等级不够不能领也不能付押金')
+
+    assert.equal((await t2.json('/api/claim', 'POST', { product_key: tk })).data.error, 'deposit_required')
+    const r2pay = await t2.json(`/api/products/${tk}/deposit`, 'POST')
+    assert.equal(new URL(r2pay.data.url).searchParams.get('money'), '8.00')
+    const r3pay = await t3.json(`/api/products/${tk}/deposit`, 'POST')
+    const q3 = Object.fromEntries(new URL(r3pay.data.url).searchParams)
+    assert.equal(q3.money, '4.00')
+    await notify(q3)
+    assert.equal((await t3.json('/api/claim', 'POST', { product_key: tk })).data.claim.deposit_cents, 400)
+    assert.equal((await t4.json(`/api/products/${tk}/deposit`, 'POST')).data.error, 'no_deposit_needed')
+    const c4t = await t4.json('/api/claim', 'POST', { product_key: tk })
+    assert.equal(c4t.status, 200)
+    assert.equal(c4t.data.claim.deposit_cents, null)
+    ok('分档押金：产品自己的押金 8，3 级减到 4，4 级免押金直接领')
+
+    // 产品的最低等级可以比全站低
+    const open = await mkp({ name: 'OpenLow', min_trust_level: 0 })
+    await tsh.json('/api/codes', 'POST', { product_key: open.data.key, codes: 'OPEN-1' })
+    assert.equal((await newbie.json('/api/claim', 'POST', { product_key: open.data.key })).status, 200)
+    assert.equal((await newbie.json('/api/claim', 'POST', { product_key: tk })).data.error, 'trust_level')
+    assert.equal((await boss.json(`/api/admin/products/${tk}`, 'PATCH', { deposit_tiers: [], deposit_cents: null })).status, 200)
+    assert.equal((await view(t4)).deposit_cents, 300)
+    ok('产品最低等级可以低于全站；清掉分档和产品押金后回到全站押金')
+
+    // 预约排队：没码时多付押金排队，每 3 个码 2 个给现领、1 个给排队
+    assert.equal((await boss.json('/api/admin/settings', 'PUT', { queue_premium_cents: 0 })).data.error, 'bad_queue_premium')
+    assert.equal((await boss.json('/api/admin/settings', 'PUT', { queue_premium_cents: 200 })).status, 200)
+    const qk = (await mkp({ name: 'Queue', relay_required: true })).data.key
+    const qseed = await new Client().devLogin('q-seed')
+    const [qd1, qd2, qd3, qA, qB] = await Promise.all(['q-d1', 'q-d2', 'q-d3', 'q-a', 'q-b'].map((n) => new Client().devLogin(n)))
+    await qseed.json('/api/codes', 'POST', { product_key: qk, codes: 'Q-0' })
+    const qview = async (cl) => (await cl.json('/api/products')).data.products.find((p) => p.key === qk)
+    assert.equal((await qA.json(`/api/products/${qk}/deposit`, 'POST', { queue: true })).data.error, 'not_empty')
+    assert.equal((await qA.json('/api/products/quick/deposit', 'POST', { queue: true })).data.error, 'no_queue')
+    const direct = async (cl, code) => {
+      const r = await cl.json(`/api/products/${qk}/deposit`, 'POST')
+      assert.equal(r.status, 200, JSON.stringify(r.data))
+      await notify(Object.fromEntries(new URL(r.data.url).searchParams))
+      const c = await cl.json('/api/claim', 'POST', { product_key: qk })
+      assert.equal(c.status, 200, JSON.stringify(c.data))
+      assert.equal(c.data.claim.code, code)
+    }
+    await direct(qd1, 'Q-0')
+    let qv = await qview(qA)
+    assert.equal(qv.available, 0)
+    assert.equal(qv.relay_chains, 1)
+    assert.equal(qv.queue_deposit_cents, 500)
+    assert.equal((await qA.json(`/api/products/${qk}/deposit`, 'POST')).data.error, 'empty')
+    const join = async (cl) => {
+      const r = await cl.json(`/api/products/${qk}/deposit`, 'POST', { queue: true })
+      assert.equal(r.status, 200, JSON.stringify(r.data))
+      assert.equal(r.data.queued, true)
+      const q = Object.fromEntries(new URL(r.data.url).searchParams)
+      assert.equal(q.money, '5.00')
+      assert.match(q.name, /排队/)
+      await notify(q)
+    }
+    await join(qA)
+    await join(qB)
+    qv = await qview(qB)
+    assert.equal(qv.queue_count, 2)
+    assert.equal(qv.my_queue_pos, 2)
+    assert.equal((await qview(qA)).my_queue_pos, 1)
+    assert.equal((await qA.json(`/api/products/${qk}/deposit`, 'POST', { queue: true })).data.error, 'has_deposit')
+    const myq = (await qA.json('/api/my/queue')).data
+    assert.equal(myq.waiting.length, 1)
+    assert.equal(myq.waiting[0].position, 1)
+    assert.equal(myq.served.length, 0)
+    ok('排队：有码时不能排，没码时付「押金 + 排队加价」进队，看得到自己排第几')
+
+    // 第 1、2 个放回的码留给现领，第 3 个发给排队的第一个人
+    await qd1.json('/api/codes', 'POST', { product_key: qk, codes: 'Q-1' })
+    assert.equal((await qA.json('/api/my/queue')).data.waiting.length, 1)
+    assert.equal((await qview(qA)).relay_chains, 1)
+    await direct(qd2, 'Q-1')
+    await qd2.json('/api/codes', 'POST', { product_key: qk, codes: 'Q-2' })
+    assert.equal((await qA.json('/api/my/queue')).data.waiting.length, 1)
+    await direct(qd3, 'Q-2')
+    await qd3.json('/api/codes', 'POST', { product_key: qk, codes: 'Q-3' })
+    const served = (await qA.json('/api/my/queue')).data
+    assert.equal(served.waiting.length, 0)
+    assert.equal(served.served.length, 1)
+    assert.equal(served.served[0].code, 'Q-3')
+    const qaDep = (await qA.json('/api/my/deposits')).data.deposits[0]
+    assert.equal(qaDep.queued, 1)
+    assert.equal(qaDep.status, 'used')
+    assert.equal((await qview(qB)).my_queue_pos, 1)
+    assert.equal((await qview(qB)).queue_count, 1)
+    ok('排队发码：每 3 个放回的码 2 个给现领、第 3 个自动发给排第一的人')
+
+    // 排到的码被别人领走后，排队押金（含加价）一起退
+    await qA.json('/api/codes', 'POST', { product_key: qk, codes: 'Q-A' })
+    const qbDep = (await qB.json('/api/my/deposits')).data.deposits[0]
+    assert.equal(qbDep.status, 'paid')
+    assert.equal((await qB.json(`/api/deposits/${qbDep.id}/refund`, 'POST')).status, 200)
+    assert.equal((await qview(qB)).queue_count, 0)
+    assert.equal((await qview(qB)).my_queue_pos, null)
+    ok('没排到可以取消排队，押金全部退回')
+    // 接力链图：q-seed → q-d1 → q-d2 → q-d3 → q-a，码（Q-A）在池子里；只给头像不给名字
+    const ch = await qA.json(`/api/products/${qk}/chains`)
+    assert.equal(ch.status, 200)
+    assert.equal(ch.data.chains.length, 1)
+    assert.equal(ch.data.relays, 4)
+    const c0 = ch.data.chains[0]
+    assert.equal(c0.state, 'pool')
+    assert.equal(c0.length, 5)
+    assert.equal(c0.nodes.length, 5)
+    assert.deepEqual(c0.nodes.map((n) => n.me), [false, false, false, false, true])
+    const raw = JSON.stringify(ch.data)
+    for (const name of ['q-seed', 'q-d1', 'q-a', 'username']) assert.ok(!raw.includes(name), name)
+    assert.equal((await new Client().json(`/api/products/${qk}/chains`)).data.chains.length, 1)
+    assert.equal((await fetch(`${BASE}/api/avatars/nope`)).status, 404)
+    ok('接力链图：一条链走到第 5 个人，码在池子里；只给头像，不带名字')
+
+    await boss.json('/api/admin/settings', 'PUT', { queue_premium_cents: 20000 })
+
+    await boss.json('/api/admin/settings', 'PUT', { relay_enabled: false, hold_hours: 24 })
+    const off = (await r1.json('/api/products')).data.products.find((p) => p.key === key)
+    assert.equal(off.deposit_cents, null)
+    ok('关掉接力后不再收押金')
+  }
+
+  console.log('重复码校验')
+  {
+    const dk = (await boss.json('/api/admin/products', 'POST', { name: 'Dup', mode: 'single' })).data.key
+    const [d1, d2, d3] = await Promise.all(['dup1', 'dup2', 'dup3'].map((n) => new Client().devLogin(n)))
+    const share = (cl, codes) => cl.json('/api/codes', 'POST', { product_key: dk, codes })
+    assert.equal((await share(d1, 'DUP-1')).data.added, 1)
+    const other = await share(d2, ' dup-1 \nDUP-OK')
+    assert.equal(other.status, 200)
+    assert.equal(other.data.added, 1)
+    assert.equal(other.data.duplicates, 1)
+    const again = await share(d1, 'dup-1')
+    assert.equal(again.status, 200)
+    assert.equal(again.data.added, 0)
+    assert.equal(again.data.duplicates, 1)
+    assert.equal((await share(d1, 'X-9\nx-9')).data.error, 'duplicate_in_batch')
+    ok('池子里已有的码（大小写、空格不同也算同一个）再放算重复跳过')
+
+    const d2id = (await d2.json('/api/my/shared')).data.codes.find((x) => x.code === 'DUP-OK').id
+    assert.equal((await d2.json(`/api/codes/${d2id}`, 'DELETE')).status, 200)
+    assert.equal((await d3.json('/api/claim', 'POST', { product_key: dk })).data.claim.code, 'DUP-1')
+    const back = await share(d3, 'DUP-1')
+    assert.equal(back.status, 409)
+    assert.equal(back.data.error, 'used_code')
+    assert.equal((await share(d1, 'Dup-1')).data.error, 'used_code')
+    assert.equal((await share(d2, 'dup 1'.replace(' ', '-'))).data.error, 'used_code')
+    ok('领过的码不能再放回池子：领的人放不回，原分享者和别人也放不回（防止两个号来回倒）')
+
+    assert.equal((await share(d1, 'DUP-2')).data.added, 1)
+    const id2 = (await d1.json('/api/my/shared')).data.codes.find((x) => x.code === 'DUP-2').id
+    assert.equal((await d1.json(`/api/codes/${id2}`, 'DELETE')).status, 200)
+    assert.equal((await share(d1, 'dup-2')).data.added, 1)
+    ok('自己撤回、没人领过的码可以重新放回')
+  }
+
+  console.log('领到的码用不了，自己退还')
+  {
+    const rk = (await boss.json('/api/admin/products', 'POST', { name: 'Ret', mode: 'single' })).data.key
+    const rs = await new Client().devLogin('ret-sharer')
+    const ru = await new Client().devLogin('ret-user')
+    const rv = await new Client().devLogin('ret-v')
+    await rs.json('/api/codes', 'POST', { product_key: rk, codes: 'RET-1\nRET-2\nRET-3\nRET-4\nRET-5\nRET-6' })
+    const c1 = (await ru.json('/api/claim', 'POST', { product_key: rk })).data.claim
+    assert.equal((await rv.json(`/api/claims/${c1.id}/return`, 'POST')).status, 404)
+    const r1 = await ru.json(`/api/claims/${c1.id}/return`, 'POST', { reason: '提示无效' })
+    assert.equal(r1.status, 200, JSON.stringify(r1.data))
+    assert.equal(r1.data.invalidated, true)
+    assert.equal((await ru.json(`/api/claims/${c1.id}/return`, 'POST')).status, 404)
+    const mine = (await ru.json('/api/my/claimed')).data.claims.find((x) => x.id === c1.id)
+    assert.ok(mine.void_at)
+    assert.equal(mine.self_returned, 1)
+    const shared = (await rs.json('/api/my/shared')).data.codes
+    assert.ok(!shared.some((x) => x.code === c1.code && x.status === 'available'))
+    const c2 = (await ru.json('/api/claim', 'POST', { product_key: rk })).data.claim
+    assert.ok(c2 && c2.code !== c1.code)
+    assert.equal((await ru.json('/api/codes', 'POST', { product_key: rk, codes: c1.code })).data.error, 'used_code')
+    const reps = (await boss.json('/api/admin/reports?status=all')).data.reports
+    const rep = reps.find((x) => x.claim_id === c1.id)
+    assert.equal(rep.status, 'confirmed')
+    assert.equal(rep.self_return, 1)
+    ok('一次性码自己退还：领取作废、码作废不再发给别人，可以再领一个；管理员能看到是自己退还的')
+
+    for (let i = 0; i < 3; i++) {
+      const c = (await rv.json('/api/claim', 'POST', { product_key: rk })).data.claim
+      assert.equal((await rv.json(`/api/claims/${c.id}/return`, 'POST')).status, 200)
+    }
+    const c4 = (await rv.json('/api/claim', 'POST', { product_key: rk })).data.claim
+    const lim = await rv.json(`/api/claims/${c4.id}/return`, 'POST')
+    assert.equal(lim.status, 429)
+    assert.equal(lim.data.error, 'return_limit')
+    ok('30 天内最多自己退还 3 次，超过要反馈给管理员')
+
+    const mk = (await boss.json('/api/admin/products', 'POST', { name: 'RetMulti', mode: 'multi', max_uses: 3 })).data.key
+    const ms = await new Client().devLogin('retm-sharer')
+    const mu = await new Client().devLogin('retm-user')
+    await ms.json('/api/codes', 'POST', { product_key: mk, codes: 'MULTI-1' })
+    const mc = (await mu.json('/api/claim', 'POST', { product_key: mk })).data.claim
+    const mr = await mu.json(`/api/claims/${mc.id}/return`, 'POST')
+    assert.equal(mr.data.invalidated, false)
+    assert.equal((await mu.json('/api/claim', 'POST', { product_key: mk })).data.error, 'empty')
+    const mrep = (await boss.json('/api/admin/reports?status=open')).data.reports.find((x) => x.claim_id === mc.id)
+    assert.equal(mrep.self_return, 1)
+    const mv = await new Client().devLogin('retm-v')
+    assert.equal((await mv.json('/api/claim', 'POST', { product_key: mk })).data.claim.code, 'MULTI-1')
+    ok('多人可用码自己退还：只作废自己这次，码留给管理员判断；退还后不能再领同一个码')
   }
 
   console.log(`\n全部通过：${passed} 项`)

@@ -12,7 +12,12 @@
     "MAX_CLAIMS_PER_DAY": "5",
     "MAX_SHARES_PER_DAY": "30",
     "DEV_LOGIN": "1",
+    "ADMIN_USERNAMES": "admin",
     "LINUXDO_CLIENT_ID": "test-client",
-    "LINUXDO_CLIENT_SECRET": "test-secret"
+    "LINUXDO_CLIENT_SECRET": "test-secret",
+    "LDC_CLIENT_ID": "ldc-test",
+    "LDC_CLIENT_SECRET": "ldc-secret",
+    "LDC_BASE": "http://127.0.0.1:8800",
+    "TEST_LOGIN_SECRET": "test-pass"
   }
 }

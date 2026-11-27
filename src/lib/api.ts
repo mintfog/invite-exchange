@@ -5,49 +5,369 @@ export type User = {
   name: string | null
   avatar_url: string | null
   trust_level: number
+  is_admin: boolean
 }
 
 export type Limits = { minTrustLevel: number; maxClaimsPerDay: number; maxSharesPerDay: number }
 
+export type Mode = 'single' | 'multi'
+
 export type Product = {
   key: string
   name: string
+  mode: Mode
+  max_uses: number
+  max_codes_per_user: number | null
+  description: string | null
+  has_pattern: number
+  share_reward_cents: number
+  claim_reward_cents: number
+  available_codes: number
   available: number
   claimed: number
   mine_available: number
+  mine_codes: number
   i_claimed: number
-  last_shared_at: number
+  last_shared_at: number | null
+  /** 领这个产品需要的最低 LinuxDO 信任等级 */
+  min_trust_level: number
+  /** 接力产品的标准押金（分）；不是接力产品是 null */
+  deposit_base_cents: number | null
+  /** 分档押金：信任等级达到 level 时押金改成 cents */
+  deposit_tiers: DepositTier[]
+  /** 接力产品：领到后还没放回自己码的人数 */
+  waiting_relays: number
+  /** 我领要付的押金（分）；null = 不用付 */
+  deposit_cents: number | null
+  /** 我已经付好、还没用的押金 */
+  has_deposit: number
+  /** 接力产品当前的接力链数：池里能领的码 + 已领走还没放回的 */
+  relay_chains: number
+  /** 正在排队的人数 */
+  queue_count: number
+  /** 我在队里排第几；没排队是 null */
+  my_queue_pos: number | null
+  /** 排队要付的押金（分）= 正常押金 + 排队加价；不是接力产品是 null */
+  queue_deposit_cents: number | null
 }
 
-export type Totals = { available: number | null; claimed: number | null; sharers: number | null }
+export type DepositTier = { level: number; cents: number }
+
+export type Totals = {
+  available: number | null
+  claimed: number | null
+  sharers: number | null
+  rewarded_cents: number | null
+}
 
 export type SharedCode = {
   id: string
+  product_key: string
   product: string
+  mode: Mode
   code: string
   note: string | null
   status: 'available' | 'claimed'
   created_at: number
-  claimed_at: number | null
-  thanked_at: number | null
-  claimer_username: string | null
-  claimer_avatar: string | null
+  max_uses: number
+  product_max_uses: number
+  used: number
+  thanks: number
+  reports_open: number
 }
 
-export type SharedSummary = { available: number | null; claimed: number | null; thanks: number | null }
+export type Claimer = {
+  id: string
+  code_id: string
+  claimed_at: number
+  thanked_at: number | null
+  username: string
+  avatar_url: string | null
+}
+
+export type SharedSummary = {
+  available: number | null
+  claimed: number | null
+  thanks: number | null
+  rewarded_cents: number | null
+  pending_cents: number | null
+}
+
+export type PayoutStatus = 'pending' | 'held' | 'sending' | 'sent' | 'failed' | 'canceled'
+
+export type MyPayout = {
+  id: string
+  kind: 'share' | 'claim'
+  code_id: string
+  product: string
+  amount_cents: number
+  status: PayoutStatus
+  due_at: number
+  created_at: number
+  sent_at: number | null
+}
 
 export type Claim = {
   id: string
+  product_key: string
   product: string
+  mode: Mode
   code: string
   note: string | null
   claimed_at: number
   thanked_at: number | null
+  void_at: number | null
+  report_status: 'open' | 'confirmed' | 'dismissed' | null
+  /** 1 = 我自己退还的 */
+  self_returned: number | null
+  sharer_username: string
+  sharer_avatar: string | null
+  deposit_id: string | null
+  deposit_status: DepositStatus | null
+  deposit_cents: number | null
+  relayed: number | null
+  refund_due_at: number | null
+}
+
+export type DepositStatus =
+  | 'pending'
+  | 'paid'
+  | 'used'
+  | 'refund_due'
+  | 'refunding'
+  | 'refunded'
+  | 'refund_failed'
+  | 'forfeited'
+
+export const DEPOSIT_STATUS: Record<DepositStatus, string> = {
+  pending: '待付款',
+  paid: '已付，还没用',
+  used: '等你放回码',
+  refund_due: '码已被领走，待退回',
+  refunding: '退回中',
+  refunded: '已退回',
+  refund_failed: '退回失败',
+  forfeited: '已没收',
+}
+
+export type Deposit = {
+  id: string
+  product_key: string
+  product: string
+  amount_cents: number
+  status: DepositStatus
+  claim_id: string | null
+  /** 1 = 排队押金 */
+  queued: number
+  relayed: number
+  refund_due_at: number | null
+  error: string | null
+  created_at: number
+  paid_at: number | null
+  refunded_at: number | null
+}
+
+export type AdminDeposit = Omit<Deposit, 'product_key'> & {
+  trade_no: string | null
+  attempts: number
+  username: string
+  avatar_url: string | null
+  relay_claims: number
+}
+
+export type NewClaim = {
+  id: string
+  code: string
+  note: string | null
+  claimed_at: number
+  product: string
+  mode: Mode
+  sharer_username: string
+  deposit_cents: number | null
+}
+
+// ----- 管理员 -----
+
+export type AdminProduct = {
+  key: string
+  name: string
+  mode: Mode
+  max_uses: number
+  max_codes_per_user: number | null
+  code_pattern: string | null
+  description: string | null
+  active: number
+  created_at: number
+  share_reward_cents: number | null
+  claim_reward_cents: number | null
+  relay_required: number
+  deposit_cents: number | null
+  min_trust_level: number | null
+  deposit_tiers: DepositTier[]
+  codes: number
+  available: number
+  claimed: number
+  sharers: number
+}
+
+export type ProductInput = {
+  name: string
+  mode: Mode
+  max_uses?: number
+  max_codes_per_user?: number | null
+  code_pattern?: string | null
+  description?: string | null
+  share_reward_cents?: number | null
+  claim_reward_cents?: number | null
+  relay_required?: boolean
+  deposit_cents?: number | null
+  min_trust_level?: number | null
+  deposit_tiers?: DepositTier[]
+  active?: boolean
+}
+
+export type AdminCode = SharedCode & { sharer_username: string; sharer_avatar: string | null }
+
+export type AdminUser = {
+  id: number
+  username: string
+  name: string | null
+  avatar_url: string | null
+  trust_level: number
+  created_at: number
+  last_login_at: number
+  codes: number
+  given: number
+  received: number
+  is_admin: boolean
+  is_test: boolean
+  /** 待发 + 发送失败的奖励（分） */
+  unpaid_cents: number
+  /** 有人反馈无效、被扣下的奖励（分） */
+  held_cents: number
+  sent_cents: number
+}
+
+export type Report = {
+  id: string
+  code_id: string
+  claim_id: string
+  reason: string | null
+  status: 'open' | 'confirmed' | 'dismissed'
+  /** 1 = 领取人自己退还的 */
+  self_return: number
+  created_at: number
+  resolved_at: number | null
+  product: string
+  mode: Mode
+  code: string
+  code_status: string
+  reporter_username: string
+  reporter_avatar: string | null
+  sharer_username: string
+  sharer_avatar: string | null
+  used: number
+  reports_on_code: number
+  held_cents: number
+}
+
+export type Settings = {
+  ldc_enabled: boolean
+  share_reward_cents: number
+  claim_reward_cents: number
+  daily_cap_cents: number
+  hold_hours: number
+  relay_enabled: boolean
+  relay_deposit_cents: number
+  queue_premium_cents: number
+}
+
+export type Chain = {
+  /** pool = 码在池子里等人领；waiting = 码在链尾的人手里，等 TA 放回自己的码 */
+  state: 'pool' | 'waiting'
+  /** 链上一共几个人 */
+  length: number
+  /** 前面没画出来的人数 */
+  earlier: number
+  /** 链上的人，只有头像（本站匿名地址），没有名字 */
+  nodes: { avatar: string | null; me: boolean }[]
+}
+
+export type QueueWaiting = {
+  id: string
+  product_key: string
+  product: string
+  amount_cents: number
+  paid_at: number
+  position: number
+}
+
+export type QueueServed = {
+  id: string
+  claim_id: string
+  product: string
+  code: string | null
+  claimed_at: number
+}
+
+export type PayoutStats = {
+  sent_24h_cents: number
+  sent_total_cents: number
+  pending: number
+  held: number
+  failed: number
+}
+
+export type AdminPayout = {
+  id: string
+  kind: 'share' | 'claim'
+  code_id: string
+  amount_cents: number
+  status: PayoutStatus
+  due_at: number
+  trade_no: string | null
+  error: string | null
+  attempts: number
+  created_at: number
+  sent_at: number | null
+  product: string
   sharer_username: string
   sharer_avatar: string | null
 }
 
-export type NewClaim = { id: string; code: string; note: string | null; claimed_at: number; product: string }
+export type RequestStatus = 'pending' | 'approved' | 'rejected' | 'canceled'
+
+export type ProductRequest = {
+  id: string
+  name: string
+  product_key: string
+  mode: Mode
+  max_uses: number | null
+  description: string | null
+  status: RequestStatus
+  admin_note: string | null
+  created_at: number
+  resolved_at: number | null
+}
+
+export type AdminProductRequest = ProductRequest & {
+  username: string
+  avatar_url: string | null
+  resolved_by_username: string | null
+  existing_product: string | null
+  existing_active: number | null
+}
+
+export type NewProductRequest = { name: string; mode: Mode; max_uses?: number; description?: string }
+
+export const REQUEST_STATUS: Record<RequestStatus, string> = {
+  pending: '待审核',
+  approved: '已通过',
+  rejected: '没通过',
+  canceled: '已撤回',
+}
+
+export type RunResult = { configured: boolean; enabled: boolean; sent: number; failed: number; waiting: number }
 
 export class ApiError extends Error {
   code: string
@@ -72,27 +392,82 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T
 }
 
+const post = <T>(path: string, body?: unknown, method = 'POST') =>
+  request<T>(path, { method, body: body === undefined ? undefined : JSON.stringify(body) })
+
 export const api = {
-  me: () => request<{ user: User | null; limits: Limits }>('/me'),
-  logout: () => request<{ ok: true }>('/auth/logout', { method: 'POST' }),
+  me: () => request<{ user: User | null; limits: Limits; test_login: boolean }>('/me'),
+  testLogin: (password: string) => post<{ ok: true }>('/auth/test-login', { password }),
+  logout: () => post<{ ok: true }>('/auth/logout'),
   products: () => request<{ products: Product[]; totals: Totals }>('/products'),
-  share: (body: { product: string; codes: string; note: string }) =>
-    request<{ added: number; duplicates: number; product_key: string }>('/codes', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
-  withdraw: (id: string) => request<{ ok: true }>(`/codes/${id}`, { method: 'DELETE' }),
-  claim: (product_key: string) =>
-    request<{ claim: NewClaim }>('/claim', { method: 'POST', body: JSON.stringify({ product_key }) }),
-  thank: (id: string) => request<{ ok: true }>(`/claims/${id}/thanks`, { method: 'POST' }),
-  myShared: () => request<{ codes: SharedCode[]; summary: SharedSummary }>('/my/shared'),
+  share: (body: { product_key: string; codes: string; note: string; uses?: number }) =>
+    post<{ added: number; duplicates: number; product_key: string; relayed: number }>('/codes', body),
+  withdraw: (id: string) => post<{ ok: true }>(`/codes/${id}`, undefined, 'DELETE'),
+  setRemaining: (id: string, remaining: number) =>
+    post<{ ok: true; remaining: number }>(`/codes/${id}`, { remaining }, 'PATCH'),
+  claim: (product_key: string) => post<{ claim: NewClaim }>('/claim', { product_key }),
+  thank: (id: string) => post<{ ok: true }>(`/claims/${id}/thanks`),
+  report: (id: string, reason: string) => post<{ ok: true }>(`/claims/${id}/report`, { reason }),
+  returnClaim: (id: string, reason: string) =>
+    post<{ ok: true; invalidated: boolean }>(`/claims/${id}/return`, { reason }),
+  chains: (key: string) => request<{ chains: Chain[]; relays: number }>(`/products/${encodeURIComponent(key)}/chains`),
+  myShared: () =>
+    request<{ codes: SharedCode[]; claimers: Claimer[]; summary: SharedSummary; payouts: MyPayout[] }>('/my/shared'),
   myClaimed: () => request<{ claims: Claim[] }>('/my/claimed'),
+  payDeposit: (product_key: string, queue = false) =>
+    post<{ url: string; id: string; amount_cents: number; queued: boolean }>(
+      `/products/${encodeURIComponent(product_key)}/deposit`,
+      queue ? { queue: true } : undefined,
+    ),
+  myQueue: () => request<{ waiting: QueueWaiting[]; served: QueueServed[] }>('/my/queue'),
+  myDeposits: () => request<{ deposits: Deposit[] }>('/my/deposits'),
+  refundDeposit: (id: string) => post<{ ok: true }>(`/deposits/${id}/refund`),
+  requestProduct: (b: NewProductRequest) => post<{ id: string }>('/product-requests', b),
+  myRequests: () => request<{ requests: ProductRequest[] }>('/my/product-requests'),
+  cancelRequest: (id: string) => post<{ ok: true }>(`/product-requests/${id}`, undefined, 'DELETE'),
+
+  admin: {
+    products: () => request<{ products: AdminProduct[] }>('/admin/products'),
+    createProduct: (b: ProductInput) => post<{ key: string }>('/admin/products', b),
+    updateProduct: (key: string, b: Partial<ProductInput>) =>
+      post<{ ok: true }>(`/admin/products/${encodeURIComponent(key)}`, b, 'PATCH'),
+    codes: (product = '', q = '') =>
+      request<{ codes: AdminCode[] }>(
+        `/admin/codes?product=${encodeURIComponent(product)}&q=${encodeURIComponent(q)}`,
+      ),
+    removeCode: (id: string) => post<{ ok: true }>(`/admin/codes/${id}`, undefined, 'DELETE'),
+    users: () => request<{ users: AdminUser[] }>('/admin/users'),
+    productRequests: (status = 'pending') =>
+      request<{ requests: AdminProductRequest[] }>(`/admin/product-requests?status=${status}`),
+    approveRequest: (id: string, b: ProductInput & { admin_note?: string | null }) =>
+      post<{ key: string; reactivated: boolean }>(`/admin/product-requests/${id}/approve`, b),
+    rejectRequest: (id: string, note: string) =>
+      post<{ ok: true }>(`/admin/product-requests/${id}/reject`, { note }),
+    reports: (status = 'open') => request<{ reports: Report[] }>(`/admin/reports?status=${status}`),
+    resolveReport: (id: string, action: 'confirm' | 'dismiss') =>
+      post<{ ok: true }>(`/admin/reports/${id}/resolve`, { action }),
+    settings: () => request<{ settings: Settings; ldc_configured: boolean; stats: PayoutStats }>('/admin/settings'),
+    saveSettings: (s: Partial<Settings>) => post<{ settings: Settings }>('/admin/settings', s, 'PUT'),
+    payouts: (status = 'all') =>
+      request<{ payouts: AdminPayout[]; stats: PayoutStats }>(`/admin/payouts?status=${status}`),
+    runPayouts: () => post<RunResult>('/admin/payouts/run'),
+    retryPayout: (id: string) => post<{ ok: true }>(`/admin/payouts/${id}/retry`),
+    cancelPayout: (id: string) => post<{ ok: true }>(`/admin/payouts/${id}/cancel`),
+    sendPayoutNow: (id: string) => post<RunResult>(`/admin/payouts/${id}/send-now`),
+    sendUserNow: (userId: number) => post<RunResult>(`/admin/users/${userId}/send-now`),
+    deposits: (status = 'all') => request<{ deposits: AdminDeposit[] }>(`/admin/deposits?status=${status}`),
+    runRefunds: () => post<{ refunded: number; failed: number }>('/admin/deposits/run'),
+    refundDeposit: (id: string) => post<{ ok: true }>(`/admin/deposits/${id}/refund`),
+    forfeitDeposit: (id: string) => post<{ ok: true }>(`/admin/deposits/${id}/forfeit`),
+  },
 }
 
 export const loginUrl = '/api/auth/login'
 
-export function timeAgo(ms: number) {
-  const s = Math.max(1, Math.round((Date.now() - ms) / 1000))
+export function timeAgo(ms: number | null | undefined) {
+  if (!ms) return '—'
+  const s = Math.round((Date.now() - ms) / 1000)
+  if (s < 0) return timeUntil(ms)
   if (s < 60) return '刚刚'
   const m = Math.round(s / 60)
   if (m < 60) return `${m} 分钟前`
@@ -101,4 +476,35 @@ export function timeAgo(ms: number) {
   const d = Math.round(h / 24)
   if (d < 30) return `${d} 天前`
   return new Date(ms).toLocaleDateString('zh-CN')
+}
+
+export function timeUntil(ms: number) {
+  const s = Math.round((ms - Date.now()) / 1000)
+  if (s <= 60) return '马上'
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m} 分钟后`
+  const h = Math.round(m / 60)
+  if (h < 48) return `${h} 小时后`
+  return `${Math.round(h / 24)} 天后`
+}
+
+/** 分 → 「1.5」这样的 LDC 数字 */
+export function ldc(cents: number | null | undefined) {
+  return String(Number(((cents ?? 0) / 100).toFixed(2)))
+}
+
+/** 「1.5」→ 150；不合法返回 null */
+export function parseLdc(s: string) {
+  const t = s.trim()
+  if (!/^\d+(\.\d{1,2})?$/.test(t)) return null
+  return Math.round(Number(t) * 100)
+}
+
+export const PAYOUT_STATUS: Record<PayoutStatus, string> = {
+  pending: '待发放',
+  held: '有反馈，暂扣',
+  sending: '发送中',
+  sent: '已到账',
+  failed: '发送失败',
+  canceled: '已取消',
 }
