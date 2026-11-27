@@ -1,12 +1,14 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "invite-exchange",
+  "name": "linuxdo-invite-relay",
   "main": "worker/index.ts",
   "compatibility_date": "2026-11-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  "routes": [{ "pattern": "exchange.fshark.cloud", "custom_domain": true }],
+  "routes": [{ "pattern": "invite.gosniffy.com", "custom_domain": true }],
   "workers_dev": false,
+  "preview_urls": false,
+  "keep_vars": true,
   "triggers": { "crons": ["0 19 * * *"] },
   "assets": {
     "not_found_handling": "single-page-application",
@@ -16,7 +18,7 @@
     {
       "binding": "DB",
       "database_name": "invite-exchange",
-      "database_id": "5ed14614-5fbb-4aae-bd96-8cbedface41e",
+      "database_id": "396c6e5c-ce1a-45a7-bfad-2cdff137d94f",
       "migrations_dir": "migrations"
     }
   ],
