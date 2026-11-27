@@ -32,6 +32,7 @@ import { SharePage } from '@/pages/share'
 import { MinePage } from '@/pages/mine'
 import { AdminPage } from '@/pages/admin'
 import { QueueWatcher } from '@/components/queue-watcher'
+import { SiteNotice } from '@/components/site-notice'
 
 type Tab = 'square' | 'share' | 'mine' | 'admin'
 const TABS: Tab[] = ['square', 'share', 'mine', 'admin']
@@ -129,7 +130,8 @@ export default function App() {
               <TabsTrigger value="mine">我的</TabsTrigger>
               {user?.is_admin ? <TabsTrigger value="admin">管理</TabsTrigger> : null}
             </TabsList>
-            <div className="ml-auto">
+            <div className="ml-auto flex shrink-0 items-center gap-1 sm:gap-2">
+              <SiteNotice />
               {!ready ? null : user ? (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
