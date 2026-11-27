@@ -1,3 +1,4 @@
+import { DurableObject } from 'cloudflare:workers'
 import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
@@ -474,6 +475,8 @@ app.onError((err, c) => {
   console.error(err)
   return c.json({ error: 'server_error', message: '服务器出错了，稍后再试' }, 500)
 })
+
+export class RelayDatabase extends DurableObject<Env> {}
 
 export default {
   fetch: app.fetch,
