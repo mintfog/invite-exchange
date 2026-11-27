@@ -9,6 +9,10 @@
   "workers_dev": false,
   "preview_urls": false,
   "keep_vars": true,
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RelayDatabase"] },
+    { "tag": "v2", "deleted_classes": ["RelayDatabase"] }
+  ],
   "triggers": { "crons": ["0 19 * * *", "*/10 * * * *"] },
   "assets": {
     "not_found_handling": "single-page-application",
