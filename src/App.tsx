@@ -131,7 +131,7 @@ export default function App() {
               {user?.is_admin ? <TabsTrigger value="admin">管理</TabsTrigger> : null}
             </TabsList>
             <div className="ml-auto flex shrink-0 items-center gap-1 sm:gap-2">
-              <SiteNotice />
+              <SiteNotice isAdmin={user?.is_admin === true} showLogin={ready && !user} />
               {!ready ? null : user ? (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>

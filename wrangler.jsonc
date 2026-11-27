@@ -36,6 +36,7 @@
     "LINUXDO_BASE": "https://connect.linux.do",
     "ADMIN_USERNAMES": "codeover",
     "DEV_LOGIN": "0",
+    "SITE_CLOSED": "1",
     "LDC_BASE": "https://credit.linux.do"
   }
   // 机密不要写在这里，用 wrangler secret put：

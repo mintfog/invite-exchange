@@ -18,6 +18,7 @@ export interface Env {
   LDC_CLIENT_ID?: string
   LDC_CLIENT_SECRET?: string
   LDC_BASE?: string
+  SITE_CLOSED?: string
   /** 测试账号的登录密码（wrangler secret put），不设就没有测试账号入口 */
   TEST_LOGIN_SECRET?: string
 }
@@ -180,6 +181,20 @@ app.use('*', async (c, next) => {
 function requireUser(c: Context<AppEnv>) {
   return c.get('user')
 }
+
+app.use('*', async (c, next) => {
+  const path = c.req.path
+  if (
+    c.env.SITE_CLOSED === '1' &&
+    c.req.method !== 'GET' && c.req.method !== 'HEAD' &&
+    !path.startsWith('/api/auth/') &&
+    !path.startsWith('/api/admin/') &&
+    !/^\/api\/deposits\/[^/]+\/refund$/.test(path)
+  ) {
+    return fail(c, 409, 'site_closed', '原作者服务器已恢复，请前往原作者网站继续接力')
+  }
+  await next()
+})
 
 async function createSession(c: Context<AppEnv>, userId: number) {
   const token = randomToken()
@@ -1456,6 +1471,7 @@ const QUEUE_STALE_MS = 10 * 60 * 1000
 // 预约排队：有人排队时，每 3 个码里 2 个留给现领、1 个发给排队的人（按付款先后）。
 // 码放进池子后 10 分钟都没人现领，也直接发给排队的人。
 export async function serveQueue(env: Env, key: string, waitUntil?: WaitUntil) {
+  if (env.SITE_CLOSED === '1') return 0
   let served = 0
   for (let round = 0; round < 20; round++) {
     const { results: queue } = await env.DB.prepare(
